@@ -28,12 +28,6 @@
 !CLAUDE.md
 !.gitignore
 
-# Scripts directory - be selective
-/scripts/*
-!/scripts/
-!/scripts/LxPS_Core/
-!/scripts/LxPS_Core/**
-
 # Keep logs and data out of version control
 /scripts_log/
 /scripts_data/
@@ -52,3 +46,13 @@ mmtile.doc
 Pathfinding-Implementation.md
 TODO.md
 COMPLETED.md
+/scripts/.api
+scripts/core_universal_kicks
+scripts/core_universal_utility
+scripts/core_lua
+scripts/common
+scripts/ext_0_plugin_universal_affix
+scripts/ext_0_plugin_universal_dispels
+scripts/ext_0_plugin_universal_items
+scripts/ext_0_plugin_universal_reflects
+scripts/ext_0_plugin_universal_racials
