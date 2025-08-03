@@ -1044,11 +1044,11 @@ function PathPlanner.run_legacy_vertex_astar(vertex_graph, start_pos, end_pos, o
     return nil
 end
 
--- Custom polygon-based pathfinding using Navigator's own MMAP parsing
+-- Optimized polygon-based pathfinding using pre-parsed MMAP data
 -- @param start_pos table: Starting position {x, y, z}
 -- @param end_pos table: Target position {x, y, z}
 -- @return table: Array of waypoint positions or nil if no path found
-function PathPlanner.find_polygon_path(start_pos, end_pos)
+function PathPlanner.find_optimized_polygon_path(start_pos, end_pos)
     local polygon_op = logger.start_operation("Custom_Polygon_Pathfinding")
     
     -- Get tile information for both start and end positions
@@ -1553,6 +1553,305 @@ function PathPlanner.ensure_minimum_waypoints(path, min_waypoints)
     logger.info("Path enhanced from " .. #path .. " to " .. #enhanced_path .. " waypoints")
     logger.end_operation(enhance_op, string.format("Enhanced: %d -> %d waypoints", #path, #enhanced_path))
     return enhanced_path
+end
+
+-- Optimized single-tile pathfinding using polygon navigation
+-- @param start_pos table: Starting position {x, y, z}
+-- @param end_pos table: Target position {x, y, z}
+-- @param tile_x number: Tile X coordinate
+-- @param tile_y number: Tile Y coordinate
+-- @param instance_id number: Instance/map ID
+-- @return table: Array of waypoint positions or nil if no path found
+function PathPlanner.find_optimized_single_tile_path(start_pos, end_pos, tile_x, tile_y, instance_id)
+    local single_tile_op = logger.start_operation("Optimized_Single_Tile_Path")
+    
+    -- Load tile data using NavMesh module
+    local tile_data = LxNavigator.NavMesh.load_tile(start_pos.x, start_pos.y)
+    
+    if not tile_data or not tile_data.loaded then
+        logger.error("Failed to load tile data for optimized pathfinding")
+        logger.end_operation(single_tile_op, "Failed - no tile data")
+        return nil
+    end
+    
+    logger.info("Tile loaded for optimized pathfinding: " .. (tile_data.vertex_count or 0) .. " vertices")
+    
+    -- Build optimized polygon navigation graph
+    local polygon_graph = PathPlanner.build_polygon_navigation_graph(tile_data)
+    
+    if not polygon_graph or #polygon_graph.nodes == 0 then
+        logger.error("Failed to build polygon navigation graph")
+        logger.end_operation(single_tile_op, "Failed - no polygon graph")
+        return nil
+    end
+    
+    logger.info("Polygon navigation graph built: " .. #polygon_graph.nodes .. " polygon nodes")
+    
+    -- Find start and end polygons
+    local start_polygon_id = PathPlanner.find_closest_polygon(start_pos, polygon_graph)
+    local end_polygon_id = PathPlanner.find_closest_polygon(end_pos, polygon_graph)
+    
+    if not start_polygon_id or not end_polygon_id then
+        logger.error("Failed to find start or end polygon in navigation graph")
+        logger.end_operation(single_tile_op, "Failed - polygon detection failed")
+        return nil
+    end
+    
+    logger.info("Polygons found - Start: " .. start_polygon_id .. ", End: " .. end_polygon_id)
+    
+    -- Run optimized A* on polygon graph
+    local polygon_path = PathPlanner.run_polygon_astar(polygon_graph, start_polygon_id, end_polygon_id, start_pos, end_pos)
+    
+    if not polygon_path or #polygon_path < 2 then
+        logger.error("Polygon A* pathfinding failed")
+        logger.end_operation(single_tile_op, "Failed - polygon A* failed")
+        return nil
+    end
+    
+    logger.info("Polygon path found with " .. #polygon_path .. " waypoints")
+    logger.end_operation(single_tile_op, string.format("Success: %d polygon waypoints", #polygon_path))
+    return polygon_path
+end
+
+-- Build navigation graph from polygon centroids and connections
+-- @param tile_data table: Loaded tile data from NavMesh module
+-- @return table: Navigation graph with polygon nodes and adjacency connections
+function PathPlanner.build_polygon_navigation_graph(tile_data)
+    local graph_op = logger.start_operation("Build_Polygon_Graph")
+    
+    if not tile_data.vertices or #tile_data.vertices == 0 then
+        logger.error("No vertices available for polygon graph")
+        logger.end_operation(graph_op, "Failed - no vertices")
+        return nil
+    end
+    
+    -- For now, use simplified vertex-based navigation since we don't have proper polygon parsing
+    -- This is a bridge solution until proper dtPoly parsing is implemented
+    local polygon_graph = {
+        nodes = {},
+        connections = {}
+    }
+    
+    -- Create navigation nodes from vertex data (simplified polygon simulation)
+    local vertex_sample_rate = math.max(1, math.floor(#tile_data.vertices / 100)) -- Sample 100 vertices max
+    local nodes_added = 0
+    
+    for i = 1, #tile_data.vertices, vertex_sample_rate do
+        local vertex = tile_data.vertices[i]
+        if vertex and LxNavigator.NavMesh.is_position_valid(vertex) then
+            nodes_added = nodes_added + 1
+            table.insert(polygon_graph.nodes, {
+                id = nodes_added,
+                position = vertex,
+                vertex_index = i
+            })
+        end
+    end
+    
+    logger.info("Polygon graph nodes created: " .. nodes_added .. " (sampled from " .. #tile_data.vertices .. " vertices)")
+    
+    -- Build connections between nearby nodes (simplified polygon adjacency)
+    local connections_built = PathPlanner.build_simplified_polygon_connections(polygon_graph)
+    
+    logger.end_operation(graph_op, string.format("Graph built: %d nodes, %d connections", #polygon_graph.nodes, connections_built))
+    return polygon_graph
+end
+
+-- Build simplified polygon connections between navigation nodes
+-- @param polygon_graph table: Navigation graph with nodes
+-- @return number: Number of connections built
+function PathPlanner.build_simplified_polygon_connections(polygon_graph)
+    local connection_op = logger.start_operation("Build_Polygon_Connections")
+    
+    local max_connection_distance = 12.0 -- Reasonable distance for polygon adjacency
+    local connections_count = 0
+    
+    for i = 1, #polygon_graph.nodes do
+        polygon_graph.connections[i] = {}
+        
+        for j = i + 1, #polygon_graph.nodes do
+            local node1 = polygon_graph.nodes[i]
+            local node2 = polygon_graph.nodes[j]
+            
+            local distance = euclidean_distance(node1.position, node2.position)
+            
+            -- Only connect nearby nodes (simulate polygon adjacency)
+            if distance <= max_connection_distance then
+                -- Check if connection is clear
+                local raycast_result = LxNavigator.NavMesh.raycast(node1.position, node2.position)
+                
+                if not raycast_result.hit then
+                    -- Add bidirectional connection
+                    table.insert(polygon_graph.connections[i], {target = j, distance = distance})
+                    if not polygon_graph.connections[j] then
+                        polygon_graph.connections[j] = {}
+                    end
+                    table.insert(polygon_graph.connections[j], {target = i, distance = distance})
+                    connections_count = connections_count + 1
+                end
+            end
+        end
+    end
+    
+    logger.end_operation(connection_op, string.format("%d connections built", connections_count))
+    return connections_count
+end
+
+-- Find closest polygon node to a given position
+-- @param position table: Position {x, y, z}
+-- @param polygon_graph table: Navigation graph with polygon nodes
+-- @return number: Polygon node ID or nil if not found
+function PathPlanner.find_closest_polygon(position, polygon_graph)
+    if not polygon_graph.nodes or #polygon_graph.nodes == 0 then
+        return nil
+    end
+    
+    local closest_id = nil
+    local closest_distance = math.huge
+    
+    for i, node in ipairs(polygon_graph.nodes) do
+        local distance = euclidean_distance(position, node.position)
+        
+        if distance < closest_distance then
+            closest_distance = distance
+            closest_id = i
+        end
+    end
+    
+    -- Only return polygon if it's reasonably close
+    if closest_distance <= ASTAR_CONFIG.POLYGON_SEARCH_RADIUS then
+        logger.debug(string.format("Found closest polygon %d at distance %.2f yards", closest_id, closest_distance))
+        return closest_id
+    else
+        logger.warning(string.format("Closest polygon %d is too far: %.2f yards", closest_id or 0, closest_distance))
+        return nil
+    end
+end
+
+-- Optimized A* pathfinding on polygon navigation graph
+-- @param polygon_graph table: Navigation graph with nodes and connections
+-- @param start_polygon_id number: Starting polygon node ID
+-- @param end_polygon_id number: Target polygon node ID
+-- @param start_pos table: Starting position (for first waypoint)
+-- @param end_pos table: Target position (for last waypoint)
+-- @return table: Array of waypoint positions or nil if no path found
+function PathPlanner.run_polygon_astar(polygon_graph, start_polygon_id, end_polygon_id, start_pos, end_pos)
+    local astar_op = logger.start_operation("Polygon_A_Star")
+    
+    if start_polygon_id == end_polygon_id then
+        -- Same polygon - direct path
+        logger.info("Start and end in same polygon - direct path")
+        logger.end_operation(astar_op, "Same polygon - direct path")
+        return {start_pos, end_pos}
+    end
+    
+    -- A* algorithm optimized for polygon navigation
+    local open_set = BinaryHeap.new(function(a, b) return a.f < b.f end)
+    local closed_set = {}
+    local came_from = {}
+    local g_score = {}
+    local f_score = {}
+    
+    -- Initialize scores
+    for i = 1, #polygon_graph.nodes do
+        g_score[i] = math.huge
+        f_score[i] = math.huge
+    end
+    
+    g_score[start_polygon_id] = 0
+    f_score[start_polygon_id] = euclidean_distance(
+        polygon_graph.nodes[start_polygon_id].position,
+        polygon_graph.nodes[end_polygon_id].position
+    )
+    
+    open_set:push({id = start_polygon_id, f = f_score[start_polygon_id]})
+    
+    local iterations = 0
+    local max_iterations = ASTAR_CONFIG.POLYGON_MAX_ITERATIONS
+    
+    logger.info("Starting polygon A* with max " .. max_iterations .. " iterations")
+    
+    while not open_set:is_empty() and iterations < max_iterations do
+        iterations = iterations + 1
+        
+        local current_item = open_set:pop()
+        local current_id = current_item.id
+        
+        if current_id == end_polygon_id then
+            -- Path found, reconstruct it
+            local path = {start_pos} -- Start with actual start position
+            local path_node_id = current_id
+            
+            -- Add polygon centroids as intermediate waypoints
+            local polygon_waypoints = {}
+            while came_from[path_node_id] do
+                table.insert(polygon_waypoints, 1, polygon_graph.nodes[path_node_id].position)
+                path_node_id = came_from[path_node_id]
+            end
+            
+            -- Add polygon waypoints
+            for _, waypoint in ipairs(polygon_waypoints) do
+                table.insert(path, waypoint)
+            end
+            
+            -- End with actual end position
+            table.insert(path, end_pos)
+            
+            logger.info("Polygon A* found path with " .. #path .. " waypoints in " .. iterations .. " iterations")
+            logger.end_operation(astar_op, string.format("Success: %d waypoints, %d iterations", #path, iterations))
+            return path
+        end
+        
+        closed_set[current_id] = true
+        
+        -- Check all connections from current polygon
+        if polygon_graph.connections[current_id] then
+            for _, connection in ipairs(polygon_graph.connections[current_id]) do
+                local neighbor_id = connection.target
+                
+                if not closed_set[neighbor_id] then
+                    local tentative_g = g_score[current_id] + connection.distance
+                    
+                    if tentative_g < g_score[neighbor_id] then
+                        came_from[neighbor_id] = current_id
+                        g_score[neighbor_id] = tentative_g
+                        f_score[neighbor_id] = tentative_g + euclidean_distance(
+                            polygon_graph.nodes[neighbor_id].position,
+                            polygon_graph.nodes[end_polygon_id].position
+                        )
+                        
+                        open_set:push({id = neighbor_id, f = f_score[neighbor_id]})
+                    end
+                end
+            end
+        end
+    end
+    
+    logger.error("Polygon A* failed to find path after " .. iterations .. " iterations")
+    logger.end_operation(astar_op, "Failed - no path found")
+    return nil
+end
+
+-- Optimized multi-tile pathfinding (placeholder for future implementation)
+-- @param start_pos table: Starting position {x, y, z}
+-- @param end_pos table: Target position {x, y, z}
+-- @param start_tile_x number: Start tile X coordinate
+-- @param start_tile_y number: Start tile Y coordinate
+-- @param end_tile_x number: End tile X coordinate
+-- @param end_tile_y number: End tile Y coordinate
+-- @param instance_id number: Instance/map ID
+-- @return table: Array of waypoint positions or nil if no path found
+function PathPlanner.find_optimized_multi_tile_path(start_pos, end_pos, start_tile_x, start_tile_y, end_tile_x, end_tile_y, instance_id)
+    local multi_tile_op = logger.start_operation("Optimized_Multi_Tile_Path")
+    
+    -- For now, fall back to the existing multi-tile implementation
+    logger.info("Using existing multi-tile pathfinding implementation")
+    
+    local result = PathPlanner.find_path_multi_tile_custom(start_pos, end_pos, 
+        start_tile_x, start_tile_y, end_tile_x, end_tile_y, instance_id)
+    
+    logger.end_operation(multi_tile_op, result and "Multi-tile success" or "Multi-tile failed")
+    return result
 end
 
 -- Optimize path by removing unnecessary waypoints using line-of-sight with performance tracking
