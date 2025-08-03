@@ -1,0 +1,54 @@
+# Project Sylvanas core files - DO NOT track
+/*.bat
+/*.exe
+/*.dll
+/*.pak
+/*.json
+/*.txt
+/*.cfg
+/*.ini
+/game_data/
+/paks/
+/locales/
+/swiftshader/
+/vk_swiftshader_icd.json
+/chrome_100_percent.pak
+/chrome_200_percent.pak
+/d3dcompiler_47.dll
+/ffmpeg.dll
+/icudtl.dat
+/libEGL.dll
+/libGLESv2.dll
+/resources.pak
+/snapshot_blob.bin
+/v8_context_snapshot.bin
+/vulkan-1.dll
+
+# But track our specific files
+!CLAUDE.md
+!.gitignore
+
+# Scripts directory - be selective
+/scripts/*
+!/scripts/
+!/scripts/LxPS_Core/
+!/scripts/LxPS_Core/**
+
+# Keep logs and data out of version control
+/scripts_log/
+/scripts_data/
+
+
+
+assets
+license
+user
+wow_settings.dat
+/.claude
+CLAUDE.md
+nul
+Hive-mind.md
+mmtile.doc
+Pathfinding-Implementation.md
+TODO.md
+COMPLETED.md
