@@ -1,6 +1,9 @@
 -- LxPS_Navigator - Advanced Navigation Library
 -- Provides A* pathfinding and navigation mesh management using Project Sylvanas API
 
+-- Required geometry utilities
+local vec3 = require("common/geometry/vector_3")
+
 -- Initialize Navigator namespace
 LxNavigator = {}
 
@@ -181,3 +184,135 @@ logger.info("Use LxNavigator.get_performance_stats() for runtime statistics")
 
 -- Log system readiness to core.log as specified in TODO
 logger.info("Navigator initialization message logged to core.log - system operational")
+
+-- ===== POLYGON VISUALIZATION SYSTEM =====
+-- Configuration for polygon drawing
+local visualization_config = {
+    enabled = false,
+    draw_all_polygons = true,
+    polygon_color = {r = 0, g = 255, b = 0, a = 100}, -- Green with transparency
+    outline_color = {r = 255, g = 255, b = 255, a = 255}, -- White outline
+    line_thickness = 1.0,
+    fade_factor = 2.5,
+    update_interval = 1.0, -- Update every 1 second
+    last_update = 0,
+    current_polygons = {},
+    current_tile_data = nil
+}
+
+
+-- Function to load and draw polygons around player
+local function update_polygon_visualization()
+    if not visualization_config.enabled then
+        return
+    end
+    
+    local current_time = core.time()
+    if current_time - visualization_config.last_update < visualization_config.update_interval then
+        return
+    end
+    
+    visualization_config.last_update = current_time
+    
+    -- Get player position
+    local player = core.player
+    if not player then return end
+    
+    local player_pos = player:position()
+    if not player_pos then return end
+    
+    -- Get current map ID
+    local map_id = core.world.map_id()
+    if not map_id then return end
+    
+    logger.info(string.format("Loading polygons for player position: %.2f, %.2f, %.2f on map %d", 
+        player_pos.x, player_pos.y, player_pos.z, map_id))
+    
+    -- Load navigation mesh for current tile
+    if LxNavigator.NavMesh and LxNavigator.NavMesh.load_tile then
+        local tile_data = LxNavigator.NavMesh.load_tile(player_pos.x, player_pos.y)
+        
+        if tile_data and tile_data.polygons then
+            logger.info(string.format("Loaded %d polygons from navigation mesh", #tile_data.polygons))
+            visualization_config.current_polygons = tile_data.polygons
+            visualization_config.current_tile_data = tile_data
+        else
+            logger.warning("No navigation mesh data found for current position")
+            visualization_config.current_polygons = {}
+            visualization_config.current_tile_data = nil
+        end
+    else
+        logger.error("NavMesh.load_tile function not available")
+    end
+end
+
+-- Function to draw polygons
+local function draw_polygons()
+    if not visualization_config.enabled or not visualization_config.current_polygons then
+        return
+    end
+    
+    local tile_data = visualization_config.current_tile_data
+    if not tile_data or not tile_data.vertices then
+        return
+    end
+    
+    for _, polygon in ipairs(visualization_config.current_polygons) do
+        if polygon.vertices and #polygon.vertices >= 3 then
+            -- Resolve vertex indices to actual coordinates
+            local polygon_vertices = {}
+            for _, vertex_index in ipairs(polygon.vertices) do
+                local vertex = tile_data.vertices[vertex_index]
+                if vertex then
+                    table.insert(polygon_vertices, vertex)
+                end
+            end
+            
+            -- Only draw if we have valid vertices
+            if #polygon_vertices >= 3 then
+                -- Draw polygon outline
+                for i = 1, #polygon_vertices do
+                    local current_vertex = polygon_vertices[i]
+                    local next_vertex = polygon_vertices[(i % #polygon_vertices) + 1]
+                    
+                    if current_vertex and next_vertex then
+                        local start_pos = vec3.new(current_vertex.x, current_vertex.y, current_vertex.z)
+                        local end_pos = vec3.new(next_vertex.x, next_vertex.y, next_vertex.z)
+                        
+                        core.graphics.line_3d(
+                            start_pos, 
+                            end_pos, 
+                            visualization_config.outline_color,
+                            visualization_config.line_thickness,
+                            visualization_config.fade_factor,
+                            true
+                        )
+                    end
+                end
+                
+                -- Draw filled triangle for polygons with exactly 3 vertices
+                if #polygon_vertices == 3 then
+                    local v1 = polygon_vertices[1]
+                    local v2 = polygon_vertices[2]  
+                    local v3 = polygon_vertices[3]
+                    
+                    if v1 and v2 and v3 then
+                        core.graphics.triangle_3d_filled(
+                            vec3.new(v1.x, v1.y, v1.z),
+                            vec3.new(v2.x, v2.y, v2.z),
+                            vec3.new(v3.x, v3.y, v3.z),
+                            visualization_config.polygon_color
+                        )
+                    end
+                end
+            end
+        end
+    end
+end
+
+-- Register callbacks
+-- DISABLED - Drawing handled by LxPS_Test
+-- core.register_on_render_callback(function()
+--     update_polygon_visualization()
+--     draw_polygons()
+-- end)

@@ -40,6 +40,17 @@ local node_pool = {}
 local pool_index = 0
 local MAX_POOL_SIZE = 10000
 
+-- Helper function to get table keys
+local function get_table_keys(t)
+    local keys = {}
+    if t then
+        for k, _ in pairs(t) do
+            table.insert(keys, tostring(k))
+        end
+    end
+    return keys
+end
+
 -- Binary heap for efficient open set management
 local BinaryHeap = {}
 BinaryHeap.__index = BinaryHeap
@@ -335,20 +346,28 @@ function PathPlanner.find_path(start_pos, end_pos, options)
     end
     logger.end_operation(polygon_path_op, "Optimized polygon pathfinding failed or insufficient waypoints")
     
-    -- PHASE 2: Fallback to direct path if very close
+    -- PHASE 2: Enhanced obstacle checking before direct path fallback
     local direct_distance = euclidean_distance(start_pos, end_pos)
-    if direct_distance <= 30.0 then -- Close enough for direct path
-        local direct_path_op = logger.start_operation("Check_Direct_Path_Fallback")
-        if PathPlanner.has_direct_path(start_pos, end_pos) then
-            logger.info("Direct path available as fallback (distance: " .. string.format("%.2f", direct_distance) .. ")")
-            logger.end_operation(direct_path_op, "Direct path found")
-            logger.end_operation(main_operation, "Direct path fallback used")
+    if direct_distance <= 15.0 then -- REDUCED: Only use direct path for very close targets
+        local direct_path_op = logger.start_operation("Enhanced_Direct_Path_Check")
+        
+        -- Enhanced obstacle detection using polygon-based validation
+        local obstacle_detected = PathPlanner.detect_obstacles_between_points(start_pos, end_pos)
+        
+        if not obstacle_detected and PathPlanner.has_enhanced_direct_path(start_pos, end_pos) then
+            logger.info("Enhanced direct path validated (distance: " .. string.format("%.2f", direct_distance) .. ")")
+            logger.end_operation(direct_path_op, "Enhanced direct path confirmed")
+            logger.end_operation(main_operation, "Enhanced direct path used")
             
             -- Create minimum 3 waypoints for direct path
             local direct_path = PathPlanner.create_direct_path_waypoints(start_pos, end_pos)
             return direct_path
+        else
+            logger.warning("Direct path blocked by obstacles despite short distance")
         end
-        logger.end_operation(direct_path_op, "No direct path available")
+        logger.end_operation(direct_path_op, "Direct path blocked or unavailable")
+    else
+        logger.info("Distance too far for direct path fallback: " .. string.format("%.2f", direct_distance) .. " yards")
     end
     
     -- PHASE 3: Fallback to legacy vertex-based A* (should rarely be needed)
@@ -454,6 +473,7 @@ function PathPlanner.find_optimized_polygon_path(start_pos, end_pos, options)
     local mesh_manager = _G.LxCore and _G.LxCore.MeshManager
     if not mesh_manager then
         logger.error("MeshManager not available - cannot use optimized polygon pathfinding")
+        logger.error("Available in _G.LxCore: " .. ((_G.LxCore and "true") or "false"))
         logger.end_operation(polygon_op, "MeshManager unavailable")
         return nil
     end
@@ -464,12 +484,20 @@ function PathPlanner.find_optimized_polygon_path(start_pos, end_pos, options)
     
     if not start_poly_idx or not start_polygon then
         logger.error("Cannot find start polygon at position (" .. string.format("%.2f", start_pos.x) .. ", " .. string.format("%.2f", start_pos.y) .. ", " .. string.format("%.2f", start_pos.z) .. ")")
+        -- Additional diagnostics
+        local tile_x, tile_y = mesh_manager.get_tile_for_position(start_pos.x, start_pos.y)
+        logger.error(string.format("Start position tile: (%s, %s)", tostring(tile_x), tostring(tile_y)))
+        logger.error("Position tolerance used: " .. tostring(ASTAR_CONFIG.POSITION_TOLERANCE))
         logger.end_operation(polygon_op, "Start polygon not found")
         return nil
     end
     
     if not end_poly_idx or not end_polygon then
         logger.error("Cannot find end polygon at position (" .. string.format("%.2f", end_pos.x) .. ", " .. string.format("%.2f", end_pos.y) .. ", " .. string.format("%.2f", end_pos.z) .. ")")
+        -- Additional diagnostics
+        local tile_x, tile_y = mesh_manager.get_tile_for_position(end_pos.x, end_pos.y)
+        logger.error(string.format("End position tile: (%s, %s)", tostring(tile_x), tostring(tile_y)))
+        logger.error("Position tolerance used: " .. tostring(ASTAR_CONFIG.POSITION_TOLERANCE))
         logger.end_operation(polygon_op, "End polygon not found")
         return nil
     end
@@ -487,10 +515,22 @@ function PathPlanner.find_optimized_polygon_path(start_pos, end_pos, options)
     local poly_graph_op = logger.start_operation("Build_Polygon_Graph")
     local polygon_graph = PathPlanner.build_polygon_navigation_graph(start_pos, end_pos)
     
-    if not polygon_graph or #polygon_graph.nodes == 0 then
-        logger.error("Failed to build polygon navigation graph")
-        logger.end_operation(poly_graph_op, "Graph build failed")
-        logger.end_operation(polygon_op, "Graph build failed")
+    if not polygon_graph then
+        logger.error("Failed to build polygon navigation graph - graph is nil")
+        logger.end_operation(poly_graph_op, "Graph build failed - nil result")
+        logger.end_operation(polygon_op, "Graph build failed - nil result")
+        return nil
+    elseif not polygon_graph.nodes or #polygon_graph.nodes == 0 then
+        logger.error("Failed to build polygon navigation graph - no nodes created")
+        local keys = {}
+        if polygon_graph then
+            for k, _ in pairs(polygon_graph) do
+                table.insert(keys, tostring(k))
+            end
+        end
+        logger.error("Available graph components: " .. table.concat(keys, ", "))
+        logger.end_operation(poly_graph_op, "Graph build failed - no nodes")
+        logger.end_operation(polygon_op, "Graph build failed - no nodes")
         return nil
     end
     
@@ -546,15 +586,25 @@ function PathPlanner.build_polygon_navigation_graph(start_pos, end_pos)
     end
     
     local filename = mesh_manager.get_mmtile_filename(continent_id, tile_x, tile_y)
+    logger.info("Loading tile data: " .. filename)
     local tile_data = _G.LxCore.FileReader.read("mmaps/" .. filename)
     
     if not tile_data or #tile_data == 0 then
+        logger.error("Tile data not found or empty for file: " .. filename)
+        logger.error("Continent ID: " .. tostring(continent_id) .. ", Tile: (" .. tostring(tile_x) .. ", " .. tostring(tile_y) .. ")")
         logger.end_operation(graph_op, "Tile data not found")
         return nil
     end
     
+    logger.info("Parsing tile data (" .. #tile_data .. " bytes)")
     local parsed_tile = _G.LxCore.Parser.parse_mmtile(tile_data)
-    if not parsed_tile or not parsed_tile.polygons or #parsed_tile.polygons == 0 then
+    if not parsed_tile then
+        logger.error("Failed to parse tile data")
+        logger.end_operation(graph_op, "Tile parsing failed")
+        return nil
+    elseif not parsed_tile.polygons or #parsed_tile.polygons == 0 then
+        logger.error("No polygons found in parsed tile")
+        logger.error("Available tile components: " .. table.concat(parsed_tile and get_table_keys(parsed_tile) or {}, ", "))
         logger.end_operation(graph_op, "No polygons in tile")
         return nil
     end
@@ -594,41 +644,69 @@ function PathPlanner.build_polygon_navigation_graph(start_pos, end_pos)
     
     -- STEP 2: Build connections using dtPoly.neis[] adjacency data
     local connections_built = 0
+    local polygons_with_neighbors = 0
+    local polygons_without_neighbors = 0
+    
     for poly_idx = 1, #parsed_tile.polygons do
         local polygon = parsed_tile.polygons[poly_idx]
         local node_id = nav_graph.polygon_map[poly_idx]
         
-        if node_id and polygon.neis then
-            -- Use dtPoly.neis[] for direct adjacency connections
-            for i = 1, polygon.vertCount do
-                local neighbor_poly_idx = polygon.neis[i]
+        if node_id then
+            if polygon.neis and polygon.vertCount then
+                local has_valid_neighbors = false
                 
-                -- Check if neighbor is a valid polygon (not external edge)
-                if neighbor_poly_idx and neighbor_poly_idx > 0 and neighbor_poly_idx <= #parsed_tile.polygons then
-                    local neighbor_node_id = nav_graph.polygon_map[neighbor_poly_idx]
+                -- Use dtPoly.neis[] for direct adjacency connections
+                for i = 1, polygon.vertCount do
+                    local neighbor_poly_idx = polygon.neis[i]
                     
-                    if neighbor_node_id and neighbor_node_id ~= node_id then
-                        -- Calculate traversal cost between polygon centroids
-                        local cost = PathPlanner.calculate_polygon_traversal_cost(
-                            nav_graph.nodes[node_id], 
-                            nav_graph.nodes[neighbor_node_id]
-                        )
+                    -- Check if neighbor is a valid polygon (not external edge)
+                    if neighbor_poly_idx and neighbor_poly_idx > 0 and neighbor_poly_idx <= #parsed_tile.polygons then
+                        local neighbor_node_id = nav_graph.polygon_map[neighbor_poly_idx]
                         
-                        -- Add bidirectional connection
-                        table.insert(nav_graph.connections[node_id], {
-                            target = neighbor_node_id,
-                            cost = cost,
-                            polygon_index = neighbor_poly_idx
-                        })
-                        
-                        connections_built = connections_built + 1
+                        if neighbor_node_id and neighbor_node_id ~= node_id then
+                            -- Calculate traversal cost between polygon centroids
+                            local cost = PathPlanner.calculate_polygon_traversal_cost(
+                                nav_graph.nodes[node_id], 
+                                nav_graph.nodes[neighbor_node_id]
+                            )
+                            
+                            -- Add bidirectional connection
+                            table.insert(nav_graph.connections[node_id], {
+                                target = neighbor_node_id,
+                                distance = cost, -- Changed from 'cost' to 'distance' to match A* usage
+                                polygon_index = neighbor_poly_idx
+                            })
+                            
+                            connections_built = connections_built + 1
+                            has_valid_neighbors = true
+                        end
                     end
                 end
+                
+                if has_valid_neighbors then
+                    polygons_with_neighbors = polygons_with_neighbors + 1
+                else
+                    polygons_without_neighbors = polygons_without_neighbors + 1
+                end
+            else
+                polygons_without_neighbors = polygons_without_neighbors + 1
+                logger.debug(string.format("Polygon %d missing neis data or vertCount (vertCount=%s)", poly_idx, tostring(polygon.vertCount)))
             end
         end
     end
     
-    logger.info("Polygon graph created: " .. nodes_created .. " nodes, " .. connections_built .. " connections")
+    logger.info(string.format("Polygon graph created: %d nodes, %d connections", nodes_created, connections_built))
+    logger.info(string.format("Connection analysis: %d polygons with neighbors, %d without neighbors", polygons_with_neighbors, polygons_without_neighbors))
+    
+    -- Validate graph connectivity
+    if connections_built == 0 then
+        logger.error("No connections built - graph will be unusable for pathfinding")
+        logger.error("This indicates issues with dtPoly.neis[] data or polygon adjacency calculation")
+    elseif connections_built < nodes_created then
+        logger.warning(string.format("Low connectivity ratio: %d connections for %d nodes (%.2f per node)", 
+            connections_built, nodes_created, connections_built / nodes_created))
+    end
+    
     logger.end_operation(graph_op, string.format("Graph created: %d nodes, %d connections", nodes_created, connections_built))
     
     return nav_graph
@@ -1767,7 +1845,7 @@ function PathPlanner.run_polygon_astar(polygon_graph, start_polygon_id, end_poly
     open_set:push({id = start_polygon_id, f = f_score[start_polygon_id]})
     
     local iterations = 0
-    local max_iterations = ASTAR_CONFIG.POLYGON_MAX_ITERATIONS
+    local max_iterations = ASTAR_CONFIG.MAX_ITERATIONS -- Use existing constant
     
     logger.info("Starting polygon A* with max " .. max_iterations .. " iterations")
     
@@ -2097,51 +2175,111 @@ end
 -- @param start_pos table: Starting position {x, y, z}
 -- @param end_pos table: Target position {x, y, z}
 -- @return boolean: True if direct path is possible
-function PathPlanner.has_direct_path(start_pos, end_pos)
-    local direct_path_op = logger.start_operation("Direct_Path_Check")
+-- Enhanced direct path validation with proper obstacle detection
+function PathPlanner.has_enhanced_direct_path(start_pos, end_pos)
+    local direct_path_op = logger.start_operation("Enhanced_Direct_Path_Check")
     
     -- Check distance first - if too far, likely not direct
     local distance = euclidean_distance(start_pos, end_pos)
-    if distance > 100.0 then -- 100 yard maximum for direct paths
+    if distance > 50.0 then -- REDUCED: 50 yard maximum for direct paths
         logger.end_operation(direct_path_op, string.format("Too far for direct path: %.2f yards", distance))
         return false
     end
     
-    -- Use NavMesh raycast to check for obstacles
-    local raycast_op = logger.start_operation("NavMesh_Raycast")
-    local raycast_result = LxNavigator.NavMesh.raycast(start_pos, end_pos)
-    logger.end_operation(raycast_op, raycast_result.hit and "Obstacle detected" or "Clear line of sight")
+    -- Enhanced sampling with tighter resolution for obstacle detection
+    local sampling_op = logger.start_operation("Enhanced_Obstacle_Sampling")
+    local samples = math.max(10, math.floor(distance / 2.0)) -- Sample every 2 yards minimum
+    local invalid_samples = 0
+    local polygon_transitions = 0
+    local last_poly_idx = nil
     
-    -- If no hit detected, path is clear
-    if not raycast_result.hit then
-        -- Double-check by sampling intermediate points
-        local sampling_op = logger.start_operation("Sample_Intermediate_Points")
-        local samples = math.max(3, math.floor(distance / 5.0)) -- Sample every 5 yards
-        local invalid_samples = 0
+    for i = 0, samples do
+        local t = i / samples
+        local sample_pos = {
+            x = start_pos.x + (end_pos.x - start_pos.x) * t,
+            y = start_pos.y + (end_pos.y - start_pos.y) * t,
+            z = start_pos.z + (end_pos.z - start_pos.z) * t
+        }
         
-        for i = 1, samples - 1 do
-            local t = i / samples
-            local sample_pos = {
-                x = start_pos.x + (end_pos.x - start_pos.x) * t,
-                y = start_pos.y + (end_pos.y - start_pos.y) * t,
-                z = start_pos.z + (end_pos.z - start_pos.z) * t
-            }
-            
-            if not LxNavigator.NavMesh.is_position_valid(sample_pos) then
-                invalid_samples = invalid_samples + 1
+        -- Check if position is on navigation mesh
+        if not LxNavigator.NavMesh.is_position_valid(sample_pos) then
+            invalid_samples = invalid_samples + 1
+            logger.debug(string.format("Invalid sample at t=%.2f: (%.2f, %.2f, %.2f)", t, sample_pos.x, sample_pos.y, sample_pos.z))
+        else
+            -- Track polygon transitions to detect complex navigation
+            local mesh_manager = _G.LxCore and _G.LxCore.MeshManager
+            if mesh_manager then
+                local poly_idx, _ = mesh_manager.find_polygon_single_tile(sample_pos.x, sample_pos.y, sample_pos.z, 1.0)
+                if poly_idx and last_poly_idx and poly_idx ~= last_poly_idx then
+                    polygon_transitions = polygon_transitions + 1
+                end
+                last_poly_idx = poly_idx
             end
-        end
-        
-        logger.end_operation(sampling_op, string.format("Sampled %d points, %d invalid", samples - 1, invalid_samples))
-        
-        if invalid_samples == 0 then
-            logger.end_operation(direct_path_op, "Direct path confirmed")
-            return true
         end
     end
     
-    logger.end_operation(direct_path_op, "No direct path available")
-    return false
+    logger.end_operation(sampling_op, string.format("Sampled %d points, %d invalid, %d polygon transitions", samples + 1, invalid_samples, polygon_transitions))
+    
+    -- Path is direct if: no invalid samples AND minimal polygon transitions
+    local is_direct = invalid_samples == 0 and polygon_transitions <= 2
+    
+    logger.end_operation(direct_path_op, is_direct and "Enhanced direct path confirmed" or "Direct path blocked by obstacles or complex navigation")
+    return is_direct
+end
+
+-- Legacy function maintained for compatibility
+function PathPlanner.has_direct_path(start_pos, end_pos)
+    return PathPlanner.has_enhanced_direct_path(start_pos, end_pos)
+end
+
+-- Advanced obstacle detection using polygon analysis
+function PathPlanner.detect_obstacles_between_points(start_pos, end_pos)
+    local obstacle_op = logger.start_operation("Advanced_Obstacle_Detection")
+    
+    local distance = euclidean_distance(start_pos, end_pos)
+    local mesh_manager = _G.LxCore and _G.LxCore.MeshManager
+    
+    if not mesh_manager then
+        logger.warning("MeshManager unavailable for obstacle detection")
+        logger.end_operation(obstacle_op, "MeshManager unavailable")
+        return true -- Assume obstacles if we can't check
+    end
+    
+    -- High-resolution sampling for obstacle detection
+    local samples = math.max(20, math.floor(distance / 1.0)) -- Sample every 1 yard
+    local obstacle_count = 0
+    local height_variance = 0
+    local last_valid_z = start_pos.z
+    
+    for i = 1, samples - 1 do
+        local t = i / samples
+        local sample_pos = {
+            x = start_pos.x + (end_pos.x - start_pos.x) * t,
+            y = start_pos.y + (end_pos.y - start_pos.y) * t,
+            z = start_pos.z + (end_pos.z - start_pos.z) * t
+        }
+        
+        local poly_idx, polygon = mesh_manager.find_polygon_single_tile(sample_pos.x, sample_pos.y, sample_pos.z, 2.0)
+        
+        if not poly_idx or not polygon then
+            obstacle_count = obstacle_count + 1
+        else
+            -- Check for significant height variations that indicate obstacles
+            local height_diff = math.abs(sample_pos.z - last_valid_z)
+            if height_diff > 5.0 then -- 5 yard height difference indicates obstacle
+                height_variance = height_variance + height_diff
+            end
+            last_valid_z = sample_pos.z
+        end
+    end
+    
+    local obstacle_percentage = (obstacle_count / (samples - 1)) * 100
+    local has_obstacles = obstacle_count > 0 or height_variance > 10.0
+    
+    logger.info(string.format("Obstacle analysis: %.1f%% blocked samples, %.1f total height variance", obstacle_percentage, height_variance))
+    logger.end_operation(obstacle_op, has_obstacles and "Obstacles detected" or "Path clear")
+    
+    return has_obstacles
 end
 
 -- Performance monitoring and statistics with comprehensive logging

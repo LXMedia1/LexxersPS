@@ -77,6 +77,17 @@ local function read_float_le(data, offset)
     return value, offset + 4
 end
 
+local function read_uint16_le(data, offset)
+    if offset + 1 > #data then return nil, offset end
+    local a, b = string.byte(data, offset, offset + 1)
+    return a + b * 256, offset + 2
+end
+
+local function read_uint8(data, offset)
+    if offset > #data then return nil, offset end
+    return string.byte(data, offset), offset + 1
+end
+
 -- Enhanced file reading function with proper MMAP parsing (fixed API)
 function NavMesh.read_file(filepath)
     LxNavigator.logger.info("Attempting to read MMAP file: " .. filepath)
@@ -104,6 +115,8 @@ function NavMesh.parse_mmap_file(data, filepath)
     local result = {
         vertices = {},
         polygons = {},
+        links = {},
+        detail_meshes = {},
         raw_data = data,
         file_size = #data,
         parsed = false,
@@ -147,8 +160,8 @@ function NavMesh.parse_mmap_file(data, filepath)
         return result
     end
     
-    -- Read Detour dtMeshHeader (84 bytes based on research)
-    if offset + 84 <= #data then
+    -- Read Detour dtMeshHeader (100 bytes - corrected structure)
+    if offset + 100 <= #data then
         local detour_magic, new_offset = read_uint32_le(data, offset)
         if detour_magic == 0x444E4156 then  -- "DNAV" 
             offset = new_offset
@@ -165,16 +178,45 @@ function NavMesh.parse_mmap_file(data, filepath)
             local detail_vert_count, new_offset11 = read_uint32_le(data, new_offset10)
             local detail_tri_count, new_offset12 = read_uint32_le(data, new_offset11)
             
-            -- Skip walkable height, radius, climb (3 floats = 12 bytes)
-            local walk_height, new_offset13 = read_float_le(data, new_offset12)
+            -- CRITICAL FIX: Read missing dtMeshHeader fields to correct offset
+            local bv_node_count, new_offset12a = read_uint32_le(data, new_offset12)
+            local offmesh_con_count, new_offset12b = read_uint32_le(data, new_offset12a)
+            local offmesh_base, new_offset12c = read_uint32_le(data, new_offset12b)
+            
+            -- Now read walkable height, radius, climb (3 floats = 12 bytes) 
+            local walk_height, new_offset13 = read_float_le(data, new_offset12c)
             local walk_radius, new_offset14 = read_float_le(data, new_offset13)
             local walk_climb, new_offset15 = read_float_le(data, new_offset14)
             
-            -- Skip bmin[3] and bmax[3] (6 floats = 24 bytes)
-            offset = new_offset15 + 24
+            -- Read bmin[3] and bmax[3] (6 floats = 24 bytes) - CRITICAL for vertex positioning
+            local bmin_x, new_offset16 = read_float_le(data, new_offset15)
+            local bmin_y, new_offset17 = read_float_le(data, new_offset16)  
+            local bmin_z, new_offset18 = read_float_le(data, new_offset17)
+            local bmax_x, new_offset19 = read_float_le(data, new_offset18)
+            local bmax_y, new_offset20 = read_float_le(data, new_offset19)
+            local bmax_z, new_offset21 = read_float_le(data, new_offset20)
             
-            -- Skip remaining header fields (bvQuantFactor, bvNodeCount, offMeshBase, offMeshConCount)
-            offset = offset + 16
+            -- Read bvQuantFactor (final field in dtMeshHeader)
+            local bv_quant_factor, new_offset22 = read_float_le(data, new_offset21)
+            
+            result.tile_bounds = {
+                min = {x = bmin_x, y = bmin_y, z = bmin_z},
+                max = {x = bmax_x, y = bmax_y, z = bmax_z}
+            }
+            result.bv_quant_factor = bv_quant_factor
+            
+            LxNavigator.logger.info("Tile bounds: min[" .. string.format("%.2f, %.2f, %.2f", bmin_x, bmin_y, bmin_z) .. 
+                                   "] max[" .. string.format("%.2f, %.2f, %.2f", bmax_x, bmax_y, bmax_z) .. "]")
+            LxNavigator.logger.info("BV Quant Factor: " .. string.format("%.6f", bv_quant_factor))
+            
+            -- Validate bounds are reasonable
+            if bmin_x < bmax_x and bmin_y < bmax_y and bmin_z < bmax_z then
+                LxNavigator.logger.info("BOUNDS VALIDATION: Tile bounds are valid")
+            else
+                LxNavigator.logger.error("BOUNDS VALIDATION: Tile bounds are corrupted - min >= max values")
+            end
+            
+            offset = new_offset22
             
             result.vertex_count = vert_count
             result.polygon_count = poly_count
@@ -199,29 +241,34 @@ function NavMesh.parse_mmap_file(data, filepath)
                     local z, new_offset3 = read_float_le(data, new_offset2)
                     
                     if x and y and z then
-                        -- Debug: Try different coordinate mappings to find the correct one
-                        -- Current player pos: X[315.64], Y[-3684.88], Z[27.14]
-                        -- Base bounds: X[-3733.33 to -3200.00], Y[0.00 to 533.33]
-                        -- Player should be: X in [-3733 to -3200], Y in [0 to 533]
+                        -- CRITICAL: MMAP vertices are stored in ABSOLUTE world coordinates, no bounds offset needed
+                        -- Simple coordinate system mapping: Game(X,Y,Z) ↔ Mesh(X,Z,Y)
+                        -- Research confirmed: vertices are already in world space, just need axis swapping
+                        local world_x = x     -- Mesh X → World X (direct mapping)
+                        local world_y = z     -- Mesh Z → World Y (axis swap)
+                        local world_z = y     -- Mesh Y → World Z (axis swap)
                         
-                        -- Test mapping: Nav(X,Y,Z) → Game(Y,Z,X+0.5) 
-                        local game_x = y  -- Nav Y → Game X 
-                        local game_y = z  -- Nav Z → Game Y 
-                        local game_z = x + 0.5  -- Nav X → Game Z + offset
-                        table.insert(result.vertices, {x = game_x, y = game_y, z = game_z})
+                        table.insert(result.vertices, {x = world_x, y = world_y, z = world_z})
                         
-                        -- Update bounds
+                        -- Debug: Log first few vertices to verify coordinate transformation
+                        if i <= 3 then
+                            LxNavigator.logger.info("Base vertex " .. i .. ": mesh(" .. 
+                                                   string.format("%.2f", x) .. ", " .. string.format("%.2f", y) .. ", " .. string.format("%.2f", z) .. 
+                                                   ") -> world(" .. string.format("%.2f", world_x) .. ", " .. string.format("%.2f", world_y) .. ", " .. string.format("%.2f", world_z) .. ")")
+                        end
+                        
+                        -- Update bounds with world coordinates
                         if i == 1 then
-                            result.bounds.min_x, result.bounds.max_x = game_x, game_x
-                            result.bounds.min_y, result.bounds.max_y = game_y, game_y
-                            result.bounds.min_z, result.bounds.max_z = game_z, game_z
+                            result.bounds.min_x, result.bounds.max_x = world_x, world_x
+                            result.bounds.min_y, result.bounds.max_y = world_y, world_y
+                            result.bounds.min_z, result.bounds.max_z = world_z, world_z
                         else
-                            result.bounds.min_x = math.min(result.bounds.min_x, game_x)
-                            result.bounds.max_x = math.max(result.bounds.max_x, game_x)
-                            result.bounds.min_y = math.min(result.bounds.min_y, game_y)
-                            result.bounds.max_y = math.max(result.bounds.max_y, game_y)
-                            result.bounds.min_z = math.min(result.bounds.min_z, game_z)
-                            result.bounds.max_z = math.max(result.bounds.max_z, game_z)
+                            result.bounds.min_x = math.min(result.bounds.min_x, world_x)
+                            result.bounds.max_x = math.max(result.bounds.max_x, world_x)
+                            result.bounds.min_y = math.min(result.bounds.min_y, world_y)
+                            result.bounds.max_y = math.max(result.bounds.max_y, world_y)
+                            result.bounds.min_z = math.min(result.bounds.min_z, world_z)
+                            result.bounds.max_z = math.max(result.bounds.max_z, world_z)
                         end
                         
                         offset = new_offset3
@@ -242,19 +289,122 @@ function NavMesh.parse_mmap_file(data, filepath)
                 LxNavigator.logger.error("Cannot parse base vertices: insufficient data")
             end
             
-            -- Skip polygons (poly_count * dtPoly_size)
-            -- dtPoly has variable size based on vertsPerPoly, but typically ~32 bytes
-            local poly_size = 32  -- Approximate size
-            offset = offset + (poly_count * poly_size)
-            LxNavigator.logger.info("Skipped " .. poly_count .. " polygons, now at offset " .. offset)
+            -- Parse polygons (dtPoly structures)
+            if poly_count > 0 and offset + (poly_count * 32) <= #data then
+                LxNavigator.logger.info("Parsing " .. poly_count .. " polygons starting at offset " .. offset)
+                
+                for i = 1, poly_count do
+                    local polygon = {}
+                    
+                    -- Read firstLink (uint32)
+                    local first_link, new_offset1 = read_uint32_le(data, offset)
+                    polygon.firstLink = first_link
+                    
+                    -- Read vertex indices (6 uint16 values, DT_VERTS_PER_POLYGON = 6)
+                    polygon.vertices = {}
+                    local verts_offset = new_offset1
+                    for v = 1, 6 do
+                        local vert_idx, new_verts_offset = read_uint16_le(data, verts_offset)
+                        if vert_idx and vert_idx ~= 0xFFFF then -- 0xFFFF means unused vertex slot
+                            table.insert(polygon.vertices, vert_idx + 1) -- Convert to 1-based indexing
+                        end
+                        verts_offset = new_verts_offset
+                    end
+                    
+                    -- Read neighbor indices (6 uint16 values)  
+                    polygon.neighbors = {}
+                    local neis_offset = verts_offset
+                    for n = 1, 6 do
+                        local nei_idx, new_neis_offset = read_uint16_le(data, neis_offset)
+                        table.insert(polygon.neighbors, nei_idx)
+                        neis_offset = new_neis_offset
+                    end
+                    
+                    -- Read flags (uint16)
+                    local flags, new_offset2 = read_uint16_le(data, neis_offset)
+                    polygon.flags = flags
+                    
+                    -- Read vertCount (uint8)
+                    local vert_count, new_offset3 = read_uint8(data, new_offset2)
+                    polygon.vertCount = vert_count
+                    
+                    -- Read areaAndtype (uint8)
+                    local area_and_type, new_offset4 = read_uint8(data, new_offset3)
+                    polygon.areaAndType = area_and_type
+                    
+                    -- Store polygon
+                    table.insert(result.polygons, polygon)
+                    
+                    offset = new_offset4
+                end
+                
+                LxNavigator.logger.info("Successfully parsed " .. #result.polygons .. " polygons")
+            else
+                LxNavigator.logger.error("Cannot parse polygons: insufficient data")
+            end
             
-            -- Skip links (max_link_count * 12 bytes for dtLink)
-            offset = offset + (max_link_count * 12)
-            LxNavigator.logger.info("Skipped " .. max_link_count .. " links, now at offset " .. offset)
+            -- Parse links (dtLink structures - 12 bytes each)
+            if max_link_count > 0 and offset + (max_link_count * 12) <= #data then
+                LxNavigator.logger.info("Parsing " .. max_link_count .. " links starting at offset " .. offset)
+                
+                for i = 1, max_link_count do
+                    local link = {}
+                    
+                    -- Read dtLink structure (12 bytes total)
+                    local ref, new_offset1 = read_uint32_le(data, offset)        -- 4 bytes
+                    local next_link, new_offset2 = read_uint32_le(data, new_offset1)  -- 4 bytes  
+                    local edge, new_offset3 = read_uint8(data, new_offset2)      -- 1 byte
+                    local side, new_offset4 = read_uint8(data, new_offset3)      -- 1 byte
+                    local bmin, new_offset5 = read_uint8(data, new_offset4)      -- 1 byte
+                    local bmax, new_offset6 = read_uint8(data, new_offset5)      -- 1 byte
+                    
+                    link.ref = ref
+                    link.next = next_link  
+                    link.edge = edge
+                    link.side = side
+                    link.bmin = bmin
+                    link.bmax = bmax
+                    
+                    -- Only store links that actually reference something
+                    if ref ~= 0 then
+                        table.insert(result.links, link)
+                    end
+                    
+                    offset = new_offset6
+                end
+                
+                LxNavigator.logger.info("Successfully parsed " .. (result.links and #result.links or 0) .. " active links")
+            else
+                LxNavigator.logger.info("No links to parse or insufficient data")
+            end
             
-            -- Skip detail meshes (detail_mesh_count * 12 bytes for dtPolyDetail)  
-            offset = offset + (detail_mesh_count * 12)
-            LxNavigator.logger.info("Skipped " .. detail_mesh_count .. " detail meshes, now at offset " .. offset)
+            -- Parse detail meshes (dtPolyDetail structures - 12 bytes each)
+            if detail_mesh_count > 0 and offset + (detail_mesh_count * 12) <= #data then
+                LxNavigator.logger.info("Parsing " .. detail_mesh_count .. " detail meshes starting at offset " .. offset)
+                
+                for i = 1, detail_mesh_count do
+                    local detail_mesh = {}
+                    
+                    -- Read dtPolyDetail structure (12 bytes total)
+                    local vert_base, new_offset1 = read_uint32_le(data, offset)      -- 4 bytes
+                    local tri_base, new_offset2 = read_uint32_le(data, new_offset1)  -- 4 bytes
+                    local vert_count, new_offset3 = read_uint8(data, new_offset2)    -- 1 byte  
+                    local tri_count, new_offset4 = read_uint8(data, new_offset3)     -- 1 byte
+                    -- 2 bytes padding
+                    offset = new_offset4 + 2
+                    
+                    detail_mesh.vertBase = vert_base
+                    detail_mesh.triBase = tri_base  
+                    detail_mesh.vertCount = vert_count
+                    detail_mesh.triCount = tri_count
+                    
+                    table.insert(result.detail_meshes, detail_mesh)
+                end
+                
+                LxNavigator.logger.info("Successfully parsed " .. #result.detail_meshes .. " detail meshes")
+            else
+                LxNavigator.logger.info("No detail meshes to parse or insufficient data")
+            end
             
             -- Parse detail vertices (detail_vert_count * 3 floats) - THESE ARE THE IMPORTANT ONES!
             if detail_vert_count > 0 and offset + (detail_vert_count * 12) <= #data then
@@ -267,18 +417,21 @@ function NavMesh.parse_mmap_file(data, filepath)
                     local z, new_offset3 = read_float_le(data, new_offset2)
                     
                     if x and y and z then
-                        -- Test mapping: Nav(X,Y,Z) → Game(Y,Z,X+0.5) 
-                        local game_x = y  -- Nav Y → Game X 
-                        local game_y = z  -- Nav Z → Game Y 
-                        local game_z = x + 0.5  -- Nav X → Game Z + offset
-                        table.insert(result.vertices, {x = game_x, y = game_y, z = game_z, detail = true})
+                        -- CRITICAL: Detail vertices are also stored in ABSOLUTE world coordinates
+                        -- Simple coordinate system mapping: Game(X,Y,Z) ↔ Mesh(X,Z,Y)
+                        -- Research confirmed: vertices are already in world space, just need axis swapping
+                        local world_x = x     -- Mesh X → World X (direct mapping)
+                        local world_y = z     -- Mesh Z → World Y (axis swap)
+                        local world_z = y     -- Mesh Y → World Z (axis swap)
+                        
+                        table.insert(result.vertices, {x = world_x, y = world_y, z = world_z, detail = true})
                         detail_vertices_added = detail_vertices_added + 1
                         
                         -- Debug: Log first few detail vertices to check coordinate conversion
                         if detail_vertices_added <= 3 then
-                            LxNavigator.logger.info("Detail vertex " .. detail_vertices_added .. ": nav(" .. 
+                            LxNavigator.logger.info("Detail vertex " .. detail_vertices_added .. ": mesh(" .. 
                                                    string.format("%.2f", x) .. ", " .. string.format("%.2f", y) .. ", " .. string.format("%.2f", z) .. 
-                                                   ") -> game(" .. string.format("%.2f", game_x) .. ", " .. string.format("%.2f", game_y) .. ", " .. string.format("%.2f", game_z) .. ")")
+                                                   ") -> world(" .. string.format("%.2f", world_x) .. ", " .. string.format("%.2f", world_y) .. ", " .. string.format("%.2f", world_z) .. ")")
                         end
                         
                         -- Skip bounds update for detail vertices (they're likely relative offsets)
@@ -363,7 +516,10 @@ function NavMesh.load_tile(x, y)
             filename = filename,
             polygons = tile_data.polygons,
             vertices = tile_data.vertices,
+            links = tile_data.links,
+            detail_meshes = tile_data.detail_meshes,
             bounds = tile_data.bounds,
+            tile_bounds = tile_data.tile_bounds,  -- Navigation mesh tile bounds
             magic = tile_data.magic,
             version = tile_data.version,
             file_size = tile_data.file_size,
