@@ -57,3 +57,6 @@ scripts/ext_0_plugin_universal_items
 scripts/ext_0_plugin_universal_reflects
 scripts/ext_0_plugin_universal_racials
 *.png
+/.crush
+CRUSH.md
+rule.md

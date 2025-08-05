@@ -188,7 +188,7 @@ logger.info("Navigator initialization message logged to core.log - system operat
 -- ===== POLYGON VISUALIZATION SYSTEM =====
 -- Configuration for polygon drawing
 local visualization_config = {
-    enabled = false,
+    enabled = true,
     draw_all_polygons = true,
     polygon_color = {r = 0, g = 255, b = 0, a = 100}, -- Green with transparency
     outline_color = {r = 255, g = 255, b = 255, a = 255}, -- White outline
@@ -197,9 +197,81 @@ local visualization_config = {
     update_interval = 1.0, -- Update every 1 second
     last_update = 0,
     current_polygons = {},
-    current_tile_data = nil
+    current_tile_data = nil,
+    -- Best-guess transform settings tuned for TrinityCore-style meshes
+    transform = {
+        enabled = true,
+        -- Mesh appears to be X (east-west), Y (north-south), Z (height). Keep identity.
+        axis_mode = "IDENTITY",
+        scale = 1.0,          -- Unit scale (adjust if exporter uses different units)
+        -- Optional tile/grid offseting; disabled by default until confirmed
+        use_tile_offsets = false,
+        tile_size = 533.333,  -- Only used when use_tile_offsets=true
+        map_offsets = {},     -- per-mapId offsets: [mapId] = {x=..., y=..., z=...}
+        z_lift = 0.05,        -- tiny lift to reduce Z-fighting with terrain
+        debug = true          -- Extra logging to help diagnose alignment
+    }
 }
 
+-- Helper: write debug line into scripts_log via logger
+local function viz_debug(msg)
+    if visualization_config.transform and visualization_config.transform.debug then
+        logger.info("[VizDebug] " .. tostring(msg))
+    end
+end
+
+-- Helper: compute per-map offset
+local function get_map_offset(map_id)
+    local t = visualization_config.transform
+    if not t or not t.map_offsets then return {x=0,y=0,z=0} end
+    return t.map_offsets[map_id] or {x=0,y=0,z=0}
+end
+
+-- Helper: best-guess coordinate transform from mesh vertex to world vec3
+local function transform_vertex(tile_data, vertex, map_id)
+    local t = visualization_config.transform or {}
+    if not vertex then return vec3.new(0,0,0) end
+
+    local mx, my, mz = vertex.x or 0, vertex.y or 0, vertex.z or 0
+
+    -- Axis conversion
+    local wx, wy, wz
+    if t.enabled and t.axis_mode == "IDENTITY" then
+        wx, wy, wz = mx, my, mz
+    else
+        -- Fallback to identity if anything else
+        wx, wy, wz = mx, my, mz
+    end
+
+    -- Scale
+    local s = t.scale or 1.0
+    wx, wy, wz = wx * s, wy * s, wz * s
+
+    -- Tile/world offsets (only if enabled and tile indices exist)
+    if t.enabled and t.use_tile_offsets and tile_data then
+        local tile_size = t.tile_size or 533.333
+        local ox, oy = 0, 0
+        if tile_data.tile_x and tile_data.tile_y then
+            ox = tile_data.tile_x * tile_size
+            oy = tile_data.tile_y * tile_size
+        end
+        wx = wx + ox
+        wy = wy + oy
+    end
+
+    -- Per-map offset
+    if t.enabled and map_id then
+        local mo = get_map_offset(map_id)
+        wx = wx + (mo.x or 0)
+        wy = wy + (mo.y or 0)
+        wz = wz + (mo.z or 0)
+    end
+
+    -- Small Z lift to avoid Z-fighting with terrain
+    wz = wz + (t.z_lift or 0)
+
+    return vec3.new(wx, wy, wz)
+end
 
 -- Function to load and draw polygons around player
 local function update_polygon_visualization()
@@ -227,6 +299,13 @@ local function update_polygon_visualization()
     
     logger.info(string.format("Loading polygons for player position: %.2f, %.2f, %.2f on map %d", 
         player_pos.x, player_pos.y, player_pos.z, map_id))
+
+    -- Debug current transform config snapshot
+    if visualization_config.transform and visualization_config.transform.debug then
+        local t = visualization_config.transform
+        viz_debug(string.format("Transform: enabled=%s axis=%s scale=%.3f use_tile_offsets=%s tile_size=%.3f z_lift=%.3f", 
+            tostring(t.enabled), tostring(t.axis_mode), t.scale or 1.0, tostring(t.use_tile_offsets), t.tile_size or 0, t.z_lift or 0))
+    end
     
     -- Load navigation mesh for current tile
     if LxNavigator.NavMesh and LxNavigator.NavMesh.load_tile then
@@ -236,6 +315,21 @@ local function update_polygon_visualization()
             logger.info(string.format("Loaded %d polygons from navigation mesh", #tile_data.polygons))
             visualization_config.current_polygons = tile_data.polygons
             visualization_config.current_tile_data = tile_data
+
+            -- Emit a couple of sample vertices pre/post transform for diagnostics
+            if visualization_config.transform and visualization_config.transform.debug then
+                local tv = tile_data.vertices
+                if tv and #tv >= 2 then
+                    local v = tv[1]
+                    local world_v = transform_vertex(tile_data, v, map_id)
+                    viz_debug(string.format("Sample vertex[1] raw=(%.2f,%.2f,%.2f) transformed=(%.2f,%.2f,%.2f)",
+                        v.x or 0, v.y or 0, v.z or 0, world_v.x, world_v.y, world_v.z))
+                    local v2 = tv[2]
+                    local world_v2 = transform_vertex(tile_data, v2, map_id)
+                    viz_debug(string.format("Sample vertex[2] raw=(%.2f,%.2f,%.2f) transformed=(%.2f,%.2f,%.2f)",
+                        v2.x or 0, v2.y or 0, v2.z or 0, world_v2.x, world_v2.y, world_v2.z))
+                end
+            end
         else
             logger.warning("No navigation mesh data found for current position")
             visualization_config.current_polygons = {}
@@ -256,57 +350,90 @@ local function draw_polygons()
     if not tile_data or not tile_data.vertices then
         return
     end
+
+    -- Fetch current mapId for consistent transforms
+    local map_id = core.world.map_id and core.world.map_id() or nil
+
+    local drawn = 0
     
     for _, polygon in ipairs(visualization_config.current_polygons) do
         if polygon.vertices and #polygon.vertices >= 3 then
-            -- Resolve vertex indices to actual coordinates
-            local polygon_vertices = {}
-            for _, vertex_index in ipairs(polygon.vertices) do
-                local vertex = tile_data.vertices[vertex_index]
-                if vertex then
-                    table.insert(polygon_vertices, vertex)
-                end
-            end
-            
-            -- Only draw if we have valid vertices
-            if #polygon_vertices >= 3 then
-                -- Draw polygon outline
-                for i = 1, #polygon_vertices do
-                    local current_vertex = polygon_vertices[i]
-                    local next_vertex = polygon_vertices[(i % #polygon_vertices) + 1]
-                    
-                    if current_vertex and next_vertex then
-                        local start_pos = vec3.new(current_vertex.x, current_vertex.y, current_vertex.z)
-                        local end_pos = vec3.new(next_vertex.x, next_vertex.y, next_vertex.z)
-                        
-                        core.graphics.line_3d(
-                            start_pos, 
-                            end_pos, 
-                            visualization_config.outline_color,
-                            visualization_config.line_thickness,
-                            visualization_config.fade_factor,
-                            true
-                        )
+            -- Optional: filter to walkable polygons if tile_data provides flags
+            if not polygon.flags or polygon.flags.walkable == nil or polygon.flags.walkable == true then
+                -- Resolve vertex indices to actual coordinates
+                local polygon_vertices = {}
+                for _, vertex_index in ipairs(polygon.vertices) do
+                    local vertex = tile_data.vertices[vertex_index]
+                    if vertex then
+                        table.insert(polygon_vertices, vertex)
                     end
                 end
                 
-                -- Draw filled triangle for polygons with exactly 3 vertices
-                if #polygon_vertices == 3 then
-                    local v1 = polygon_vertices[1]
-                    local v2 = polygon_vertices[2]  
-                    local v3 = polygon_vertices[3]
-                    
-                    if v1 and v2 and v3 then
-                        core.graphics.triangle_3d_filled(
-                            vec3.new(v1.x, v1.y, v1.z),
-                            vec3.new(v2.x, v2.y, v2.z),
-                            vec3.new(v3.x, v3.y, v3.z),
-                            visualization_config.polygon_color
-                        )
+                -- Only draw if we have valid vertices
+                if #polygon_vertices >= 3 then
+                    -- Draw polygon outline (using transformed vertices)
+                    for i = 1, #polygon_vertices do
+                        local current_vertex = polygon_vertices[i]
+                        local next_vertex = polygon_vertices[(i % #polygon_vertices) + 1]
+                        
+                        if current_vertex and next_vertex then
+                            local start_pos = transform_vertex(tile_data, current_vertex, map_id)
+                            local end_pos = transform_vertex(tile_data, next_vertex, map_id)
+                            
+                            core.graphics.line_3d(
+                                start_pos, 
+                                end_pos, 
+                                visualization_config.outline_color,
+                                visualization_config.line_thickness,
+                                visualization_config.fade_factor,
+                                true
+                            )
+                        end
                     end
+                    
+                    -- Triangulate simple polygons: draw fan if > 3
+                    if #polygon_vertices == 3 then
+                        local v1 = polygon_vertices[1]
+                        local v2 = polygon_vertices[2]  
+                        local v3 = polygon_vertices[3]
+                        
+                        if v1 and v2 and v3 then
+                            local p1 = transform_vertex(tile_data, v1, map_id)
+                            local p2 = transform_vertex(tile_data, v2, map_id)
+                            local p3 = transform_vertex(tile_data, v3, map_id)
+
+                            core.graphics.triangle_3d_filled(
+                                p1,
+                                p2,
+                                p3,
+                                visualization_config.polygon_color
+                            )
+                        end
+                    elseif #polygon_vertices > 3 then
+                        -- Simple fan triangulation for convex polygons
+                        local base = polygon_vertices[1]
+                        for i = 2, #polygon_vertices - 1 do
+                            local v2 = polygon_vertices[i]
+                            local v3 = polygon_vertices[i+1]
+                            local p1 = transform_vertex(tile_data, base, map_id)
+                            local p2 = transform_vertex(tile_data, v2, map_id)
+                            local p3 = transform_vertex(tile_data, v3, map_id)
+                            core.graphics.triangle_3d_filled(
+                                p1,
+                                p2,
+                                p3,
+                                visualization_config.polygon_color
+                            )
+                        end
+                    end
+                    drawn = drawn + 1
                 end
             end
         end
+    end
+
+    if visualization_config.transform and visualization_config.transform.debug then
+        viz_debug("Drawn polygons (after filtering/triangulation): " .. tostring(drawn))
     end
 end
 

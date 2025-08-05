@@ -282,6 +282,76 @@ function MeshManager.get_current_continent_id()
     return current_continent_id
 end
 
+--- Load all available tiles for a given continent (instance/map id)
+--- This scans the 64x64 grid and attempts to read and parse each mmtile file.
+--- Returns a summary with counts and a list of successfully loaded tiles.
+---@param continent_id number The continent/map id
+---@param options table|nil Optional flags {parse=true|false} to parse tiles for verification
+---@return table result {count, parsed_count, files_found, tiles}
+function MeshManager.load_all_tiles_for_continent(continent_id, options)
+    options = options or {}
+    local parse_tiles = options.parse ~= false -- default true
+
+    local result = {
+        count = 0,            -- number of tile files found (exist)
+        parsed_count = 0,     -- number of tiles successfully parsed
+        files_found = {},     -- list of filenames that exist
+        tiles = {}            -- map filename -> {tile_x, tile_y, data?}
+    }
+
+    local found_first = false
+    for tile_x = 0, 63 do
+        for tile_y = 0, 63 do
+            local filename = MeshManager.get_mmtile_filename(continent_id, tile_x, tile_y)
+            local data = LxCore.FileReader.read("mmaps/" .. filename)
+            if data and #data > 0 then
+                result.count = result.count + 1
+                table.insert(result.files_found, filename)
+
+                if parse_tiles then
+                    local ok, parsed = pcall(LxCore.Parser.parse_mmtile, data)
+                    if ok and parsed then
+                        result.parsed_count = result.parsed_count + 1
+                        result.tiles[filename] = {
+                            tile_x = tile_x,
+                            tile_y = tile_y,
+                            data = parsed
+                        }
+                        -- Log a small header sample for the first few found
+                        if not found_first then
+                            log.write(string.format("First tile found: %s | poly=%d vert=%d boundsX[%.2f..%.2f] Y[%.2f..%.2f] Z[%.2f..%.2f]",
+                                filename,
+                                parsed.header.polyCount, parsed.header.vertCount,
+                                parsed.header.bmin_x, parsed.header.bmax_x,
+                                parsed.header.bmin_z, parsed.header.bmax_z,
+                                parsed.header.bmin_y, parsed.header.bmax_y))
+                            found_first = true
+                        end
+                    else
+                        log.error("Failed to parse tile: " .. filename)
+                        result.tiles[filename] = {
+                            tile_x = tile_x,
+                            tile_y = tile_y,
+                            data = nil
+                        }
+                    end
+                else
+                    result.tiles[filename] = {
+                        tile_x = tile_x,
+                        tile_y = tile_y,
+                        data = nil
+                    }
+                end
+            end
+        end
+    end
+
+    log.write(string.format("Tile scan summary for continent %d: files_found=%d parsed=%d",
+        continent_id, result.count, result.parsed_count))
+
+    return result
+end
+
 --- Get current tile grid information
 ---@return table Information about the currently loaded tile grid
 function MeshManager.get_tile_grid_info()
@@ -325,6 +395,19 @@ function MeshManager.get_tile_for_position(x, y)
     return tile_x, tile_y
 end
 
+--- DEPRECATED: Floor-based tile calculation (INCORRECT - DO NOT USE)
+--- This function is deprecated and should not be used. Use get_tile_for_position instead.
+--- Kept only for compatibility during transition period.
+---@param x number
+---@param y number
+---@return number|nil, number|nil
+---@deprecated Use get_tile_for_position instead
+function MeshManager.get_tile_for_position_floor(x, y)
+    -- DEPRECATED: This calculation is incorrect. Use get_tile_for_position instead.
+    log.warning("DEPRECATED: get_tile_for_position_floor is incorrect. Use get_tile_for_position instead.")
+    return MeshManager.get_tile_for_position(x, y)
+end
+
 --- Get current player tile based on player position
 ---@return number|nil, number|nil Current tile X and Y indices, or nil if player not found
 function MeshManager.get_current_player_tile()
@@ -343,6 +426,7 @@ end
 ---@param tile_y number The tile Y coordinate
 ---@return string The mmtile filename
 function MeshManager.get_mmtile_filename(continent_id, tile_x, tile_y)
+    -- Confirmed format: IIIIYYXX (instance 4 digits, tile_y 2 digits, tile_x 2 digits)
     return string.format("%04d%02d%02d.mmtile", continent_id, tile_y, tile_x)
 end
 
@@ -359,6 +443,59 @@ function MeshManager.get_current_tile_filename()
     end
     
     return MeshManager.get_mmtile_filename(current_continent_id, tile_x, tile_y)
+end
+
+--- Probe utility: determine current tile via both ceil and floor formulas and log details
+function MeshManager.probe_current_tile()
+    local player = core.object_manager.get_local_player()
+    if not player then
+        log.error("probe_current_tile: no player")
+        return nil
+    end
+    local pos = player:get_position()
+    if not pos or not current_continent_id then
+        log.error("probe_current_tile: missing pos or continent")
+        return nil
+    end
+
+    local cx, cy = MeshManager.get_tile_for_position(pos.x, pos.y)
+
+    log.write(string.format("Probe pos=(%.2f, %.2f, %.2f) tile=[%s,%s] (using correct ceil formula)",
+        pos.x, pos.y, pos.z, tostring(cx), tostring(cy)))
+
+    local function try_load(tx, ty, label)
+        if not tx or not ty then return nil end
+        local fname = MeshManager.get_mmtile_filename(current_continent_id, tx, ty)
+        local bin = LxCore.FileReader.read("mmaps/" .. fname)
+        if not bin or #bin == 0 then
+            log.write(label .. " file missing: " .. fname)
+            return { filename = fname, exists = false }
+        end
+        local parsed = LxCore.Parser.parse_mmtile(bin)
+        if not parsed then
+            log.error(label .. " failed to parse: " .. fname)
+            return { filename = fname, exists = true, parsed = false }
+        end
+        local h = parsed.header
+        log.write(string.format("%s %s parsed: poly=%d vert=%d boundsX[%.2f..%.2f] Y[%.2f..%.2f] Z[%.2f..%.2f]",
+            label, fname, h.polyCount, h.vertCount, h.bmin_x, h.bmax_x, h.bmin_z, h.bmax_z, h.bmin_y, h.bmax_y))
+
+        local inside_x = pos.x >= h.bmin_x and pos.x <= h.bmax_x
+        local inside_y = pos.y >= h.bmin_z and pos.y <= h.bmax_z
+        local inside_z = pos.z >= h.bmin_y and pos.z <= h.bmax_y
+        log.write(string.format("%s inside? X=%s Y=%s Z=%s", label, tostring(inside_x), tostring(inside_y), tostring(inside_z)))
+
+        return {
+            filename = fname,
+            exists = true,
+            parsed = true,
+            bounds = h,
+            contains_player = inside_x and inside_y and inside_z
+        }
+    end
+
+    local r1 = try_load(cx, cy, "CORRECT")
+    return { correct = r1, pos = {x=pos.x,y=pos.y,z=pos.z}, continent_id = current_continent_id }
 end
 
 --- Check if a point is inside a polygon using ray casting algorithm

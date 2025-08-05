@@ -239,11 +239,29 @@ local function draw_vertex_mesh(vertices, polygon_color)
 end
 
 -- Draw polygon at a specific position using real polygon data
+-- FINAL, minimal and correct transform:
+--   world.x = nav.x
+--   world.y = nav.z
+--   world.z = nav.y
+-- No tile-origin or bounds offsets are added. The Detour vertices we parse
+-- are already in absolute world space (logs showed nav.z ~ -3700 matching player.y).
+-- Previous origin adjustments caused large XY shifts; previous bmin_y addition sank Z.
 local function draw_polygon_at_position(position, polygon_color)
     if not LxNavigator or not LxNavigator.NavMesh then
         return
     end
-    
+
+    -- Capture diagnostics
+    local instance_id = LxNavigator.NavMesh.get_current_instance_id()
+    local tile_x, tile_y = LxNavigator.NavMesh.get_tile_for_position(position.x, position.y)
+
+    -- Compute expected world-space origin of this tile (TrinityCore/WoW grid)
+    -- World coords increase to the north/east; tiles are 533.3333 wide; origin at (32,32)
+    local GRID_SIZE = 533.3333
+    local ORIGIN_OFFSET = 32
+    local tile_origin_x = (ORIGIN_OFFSET - tile_x) * GRID_SIZE
+    local tile_origin_y = (ORIGIN_OFFSET - tile_y) * GRID_SIZE
+
     -- Get the tile data for this position
     local tile_data = LxNavigator.NavMesh.load_tile(position.x, position.y)
     if not tile_data or not tile_data.vertices or #tile_data.vertices == 0 then
@@ -255,19 +273,62 @@ local function draw_polygon_at_position(position, polygon_color)
         log_error("No polygon data available in tile")
         return
     end
-    
+
     log_info("Drawing ALL " .. #tile_data.polygons .. " polygons in tile at position: " .. string.format("(%.2f, %.2f, %.2f)", position.x, position.y, position.z))
+    log_info(string.format("Tile indices: (%s, %s) instance_id=%s filename=%s", tostring(tile_x), tostring(tile_y), tostring(instance_id), tostring(tile_data.filename)))
+    -- Also log player pos to compare with first polygon height after mapping
+    local player = core.object_manager.get_local_player()
+    if player then
+        local p = player:get_position()
+        log_info(string.format("Player position: (%.2f, %.2f, %.2f)", p.x, p.y, p.z))
+    end
+
+    -- Throttle structured logfile creation (max 1 file per 2 seconds) and reuse the same file during the interval
+    _G.__lxps_last_draw_log_time = _G.__lxps_last_draw_log_time or 0
+    _G.__lxps_last_draw_log_file = _G.__lxps_last_draw_log_file or nil
+    local now = math.floor(core.game_time())
+    local logfile
+    if now - (_G.__lxps_last_draw_log_time or 0) >= 2000 or not _G.__lxps_last_draw_log_file then
+        logfile = string.format("mmtile_draw_%s_%02d_%02d_%d.log",
+            tostring(instance_id or -1), tonumber(tile_y or -1), tonumber(tile_x or -1), now)
+        core.create_log_file(logfile)
+        _G.__lxps_last_draw_log_time = now
+        _G.__lxps_last_draw_log_file = logfile
+    else
+        logfile = _G.__lxps_last_draw_log_file
+    end
+    local function writeln(line) core.write_log_file(logfile, line .. "\n") end
+
+    writeln("=== MMAP TILE DRAW DEBUG ===")
+    writeln(string.format("time_ms=%d instance_id=%s tile_x=%s tile_y=%s", now, tostring(instance_id), tostring(tile_x), tostring(tile_y)))
+    writeln(string.format("world_pos=(%.2f, %.2f, %.2f)", position.x, position.y, position.z))
+    writeln(string.format("filename=%s poly_count=%d vert_count=%d", tostring(tile_data.filename), tile_data.polygon_count or 0, tile_data.vertex_count or 0))
+
+    -- FINAL mapping (absolute coordinates, no extra offsets) + Y sign to match WoW left-handed world:
+    -- Detour vertex: (x, y, z) with y=height, z=east‑west (right‑handed).
+    -- WoW world: (x, y, z) with y=east‑west but left‑handed along Y. Empirically, we must invert Y.
+    -- world = (x, -z, y)
+    local function to_world(v)
+        return { x = v.x, y = -v.z, z = v.y }
+    end
     
-    -- Log tile bounds information
+    -- Log tile bounds information (for reference only)
     if tile_data.tile_bounds then
-        log_info("Tile bounds: min[" .. string.format("%.2f, %.2f, %.2f", tile_data.tile_bounds.min.x, tile_data.tile_bounds.min.y, tile_data.tile_bounds.min.z) .. 
+        log_info("Tile bounds: min[" .. string.format("%.2f, %.2f, %.2f", tile_data.tile_bounds.min.x, tile_data.tile_bounds.min.y, tile_data.tile_bounds.min.z) ..
                 "] max[" .. string.format("%.2f, %.2f, %.2f", tile_data.tile_bounds.max.x, tile_data.tile_bounds.max.y, tile_data.tile_bounds.max.z) .. "]")
+        writeln(string.format("tile_bounds_min=(%.2f, %.2f, %.2f) tile_bounds_max=(%.2f, %.2f, %.2f)",
+            tile_data.tile_bounds.min.x, tile_data.tile_bounds.min.y, tile_data.tile_bounds.min.z,
+            tile_data.tile_bounds.max.x, tile_data.tile_bounds.max.y, tile_data.tile_bounds.max.z))
+        writeln("note=using world=(x,-z,y) to fix handedness and align with player.y sign")
     else
         log_info("No tile bounds data available")
+        writeln("tile_bounds_min=NA tile_bounds_max=NA")
     end
+    writeln(string.format("tile_origin=(%.2f, %.2f)", tile_origin_x, tile_origin_y))
     
     local polygons_drawn = 0
     local polygons_skipped = 0
+    local first_world_vertices = {}
     
     -- Draw ALL polygons in the tile
     for poly_idx, polygon in ipairs(tile_data.polygons) do
@@ -282,7 +343,12 @@ local function draw_polygon_at_position(position, polygon_color)
                     if vert_idx and vert_idx > 0 and vert_idx <= #tile_data.vertices then
                         local vertex = tile_data.vertices[vert_idx]
                         if vertex then
-                            table.insert(polygon_vertices, vertex)
+                            -- Enforce consistent world mapping to avoid axis mix-ups
+                            local wv = to_world(vertex)
+                            table.insert(polygon_vertices, wv)
+                            if polygons_drawn == 0 and #first_world_vertices < 4 then
+                                table.insert(first_world_vertices, wv)
+                            end
                         end
                     end
                 end
@@ -294,6 +360,27 @@ local function draw_polygon_at_position(position, polygon_color)
                         log_info("First polygon vertices:")
                         for vi, v in ipairs(polygon_vertices) do
                             log_info("  V" .. vi .. ": (" .. string.format("%.2f, %.2f, %.2f", v.x, v.y, v.z) .. ")")
+                        end
+                        -- Also log tile bounds to compare axis ranges
+                        if tile_data.tile_bounds then
+                            log_info(string.format("Bounds check (nav-space): Y(height)=[%.2f..%.2f], Z(east-west)=[%.2f..%.2f]",
+                                tile_data.tile_bounds.min.y, tile_data.tile_bounds.max.y,
+                                tile_data.tile_bounds.min.z, tile_data.tile_bounds.max.z))
+                            if #first_world_vertices > 0 then
+                                local v0 = first_world_vertices[1]
+                                log_info(string.format("Mapped first vertex world=(%.2f, %.2f, %.2f)", v0.x, v0.y, v0.z))
+                                -- Sanity: player vs mapped
+                                local pl = core.object_manager.get_local_player()
+                                if pl then
+                                    local pp = pl:get_position()
+                                    log_info(string.format("Player=(%.2f, %.2f, %.2f) | ΔXY=(%.2f, %.2f) ΔZ=%.2f",
+                                        pp.x, pp.y, pp.z, v0.x - pp.x, v0.y - pp.y, v0.z - pp.z))
+                                end
+                            end
+                        end
+                        -- Persist the first polygon vertices (world-mapped) to logfile for post-mortem
+                        for i, v in ipairs(first_world_vertices) do
+                            writeln(string.format("first_poly_v%d_world=(%.2f, %.2f, %.2f)", i, v.x, v.y, v.z))
                         end
                     end
                     draw_vertex_mesh(polygon_vertices, polygon_color)
@@ -310,6 +397,8 @@ local function draw_polygon_at_position(position, polygon_color)
     end
     
     log_info("Drew " .. polygons_drawn .. " walkable polygons, skipped " .. polygons_skipped .. " non-walkable/invalid polygons")
+    writeln(string.format("summary: drawn=%d skipped=%d", polygons_drawn, polygons_skipped))
+    writeln("=== END ===")
 end
 
 -- Enhanced drawing function with polygon visualization using triangles and rectangles

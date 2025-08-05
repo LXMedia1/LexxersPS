@@ -13,13 +13,15 @@ local tile_cache = {}
 
 -- Tile calculation functions
 function NavMesh.get_tile_for_position(x, y)
+    -- Convert world coordinates to tile indices using TrinityCore formula (CORRECT IMPLEMENTATION)
+    -- Uses ceil to match MeshManager working implementation
     local tile_x = ORIGIN_OFFSET - math.ceil(x / GRID_SIZE)
     local tile_y = ORIGIN_OFFSET - math.ceil(y / GRID_SIZE)
-    
+
     -- Clamp to valid tile range [0, 63]
     tile_x = math.max(0, math.min(63, tile_x))
     tile_y = math.max(0, math.min(63, tile_y))
-    
+
     return tile_x, tile_y
 end
 
@@ -495,21 +497,26 @@ function NavMesh.load_tile(x, y)
     local tile_x, tile_y = NavMesh.get_tile_for_position(x, y)
     local instance_id = NavMesh.get_current_instance_id()
     local tile_key = instance_id .. "_" .. tile_x .. "_" .. tile_y
-    
+
+    -- Log resolution for diagnostics
+    LxNavigator.logger.info(string.format("Resolving tile: world(%.2f, %.2f) -> indices(%d, %d) instance=%d",
+        x, y, tile_x, tile_y, instance_id or -1))
+
     -- Check cache first
     if tile_cache[tile_key] then
         return tile_cache[tile_key]
     end
-    
+
     -- Attempt to load tile file
     local filename = NavMesh.get_mmtile_filename(instance_id, tile_x, tile_y)
     local filepath = "mmaps/" .. filename
+    LxNavigator.logger.info(string.format("Loading mmtile file: %s (IIIIYYXX)", filename))
     local tile_data = NavMesh.read_file(filepath)
-    
+
     if tile_data and tile_data.parsed then
         LxNavigator.logger.info("Successfully loaded and parsed tile: " .. filename)
         LxNavigator.logger.info("Tile contains " .. tile_data.vertex_count .. " vertices")
-        
+
         -- Cache the parsed tile data
         tile_cache[tile_key] = {
             loaded = true,
@@ -533,7 +540,7 @@ function NavMesh.load_tile(x, y)
             filename = filename
         }
     end
-    
+
     return tile_cache[tile_key]
 end
 
