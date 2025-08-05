@@ -106,7 +106,7 @@ function M.ensure_loaded_current_tile()
   local iid = Core.get_instance_id(); if not iid then return end
   local player = Core.get_player(); if not player then return end
   local pos = player:get_position(); if not pos then return end
-  local ty, tx = Index.get_tile_for_position_ceil(pos.x, pos.y)
+  local ty, tx = Index.get_tile_for_position(pos.x, pos.y)
   if not (tx and ty) then return end
   local key = tostring(iid)..":"..tostring(tx)..":"..tostring(ty)
   if M.cache.key == key and M.cache.tris then return end

@@ -134,7 +134,7 @@ local function log_current_calculation()
         return
     end
     local fx, fy = Index.get_tile_for_position(pos.x, pos.y)
-    local cx, cy = Index.get_tile_for_position_ceil(pos.x, pos.y)
+    local cx, cy = Index.get_tile_for_position(pos.x, pos.y)
     Core.log_info(string.format("current_calc pos=(%.2f,%.2f,%.2f) floor=[%s,%s] ceil=[%s,%s]",
         pos.x, pos.y, pos.z, tostring(fx), tostring(fy), tostring(cx), tostring(cy)))
 end

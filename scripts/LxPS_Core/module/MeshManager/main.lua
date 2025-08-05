@@ -395,18 +395,6 @@ function MeshManager.get_tile_for_position(x, y)
     return tile_x, tile_y
 end
 
---- DEPRECATED: Floor-based tile calculation (INCORRECT - DO NOT USE)
---- This function is deprecated and should not be used. Use get_tile_for_position instead.
---- Kept only for compatibility during transition period.
----@param x number
----@param y number
----@return number|nil, number|nil
----@deprecated Use get_tile_for_position instead
-function MeshManager.get_tile_for_position_floor(x, y)
-    -- DEPRECATED: This calculation is incorrect. Use get_tile_for_position instead.
-    log.warning("DEPRECATED: get_tile_for_position_floor is incorrect. Use get_tile_for_position instead.")
-    return MeshManager.get_tile_for_position(x, y)
-end
 
 --- Get current player tile based on player position
 ---@return number|nil, number|nil Current tile X and Y indices, or nil if player not found

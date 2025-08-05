@@ -40,6 +40,7 @@ local menu_elements = {
     clear_data_button = core.menu.button("clear_data"),
     debug_tile_button = core.menu.button("debug_tile_data"),
     draw_current_poly_button = core.menu.button("draw_current_poly"),
+    generate_mesh_button = core.menu.button("generate_mesh"),
     status_header = core.menu.header()
 }
 
@@ -168,7 +169,6 @@ local function run_tests()
     log_info("Tests completed: " .. tests_passed .. "/" .. tests_total .. " passed")
 end
 
--- REMOVED: Tile format testing - Format established as IIIIYYXX
 
 local function clear_data()
     LxTest.state.start_position = nil
@@ -183,316 +183,270 @@ local function toggle_path_drawing()
 end
 
 
--- Draw mesh from vertex data to form polygon-like visualization
-local function draw_vertex_mesh(vertices, polygon_color)
-    if not vertices or #vertices < 3 then
-        return
-    end
-    
-    -- Validate vertices have valid coordinates
-    for i, v in ipairs(vertices) do
-        if not v.x or not v.y or not v.z then
-            log_error("Invalid vertex at index " .. i .. " - missing coordinates")
-            return
-        end
-    end
-    
-    -- Draw polygon based on vertex count
-    if #vertices == 3 then
-        -- Triangle - use triangle_3d_filled
-        local v1 = vec3.new(vertices[1].x, vertices[1].y, vertices[1].z)
-        local v2 = vec3.new(vertices[2].x, vertices[2].y, vertices[2].z)
-        local v3 = vec3.new(vertices[3].x, vertices[3].y, vertices[3].z)
-        
-        core.graphics.triangle_3d_filled(v1, v2, v3, polygon_color)
-    elseif #vertices == 4 then
-        -- Rectangle - use rect_3d_filled
-        core.graphics.rect_3d_filled(
-            vec3.new(vertices[1].x, vertices[1].y, vertices[1].z),
-            vec3.new(vertices[2].x, vertices[2].y, vertices[2].z),
-            vec3.new(vertices[3].x, vertices[3].y, vertices[3].z),
-            vec3.new(vertices[4].x, vertices[4].y, vertices[4].z),
-            polygon_color
-        )
-    else
-        -- More vertices - use fan triangulation
-        local first = vec3.new(vertices[1].x, vertices[1].y, vertices[1].z)
-        for i = 2, #vertices - 1 do
-            core.graphics.triangle_3d_filled(
-                first,
-                vec3.new(vertices[i].x, vertices[i].y, vertices[i].z),
-                vec3.new(vertices[i+1].x, vertices[i+1].y, vertices[i+1].z),
-                polygon_color
-            )
-        end
-    end
-    
-    -- Draw outline
-    for i = 1, #vertices do
-        local next_i = (i % #vertices) + 1
-        core.graphics.line_3d(
-            vec3.new(vertices[i].x, vertices[i].y, vertices[i].z),
-            vec3.new(vertices[next_i].x, vertices[next_i].y, vertices[next_i].z),
-            color.new(255, 255, 255, 255) -- White outline
-        )
-    end
-end
-
--- Draw polygon at a specific position using real polygon data
--- FINAL, minimal and correct transform:
---   world.x = nav.x
---   world.y = nav.z
---   world.z = nav.y
--- No tile-origin or bounds offsets are added. The Detour vertices we parse
--- are already in absolute world space (logs showed nav.z ~ -3700 matching player.y).
--- Previous origin adjustments caused large XY shifts; previous bmin_y addition sank Z.
-local function draw_polygon_at_position(position, polygon_color)
-    if not LxNavigator or not LxNavigator.NavMesh then
-        return
-    end
-
-    -- Capture diagnostics
-    local instance_id = LxNavigator.NavMesh.get_current_instance_id()
-    local tile_x, tile_y = LxNavigator.NavMesh.get_tile_for_position(position.x, position.y)
-
-    -- Compute expected world-space origin of this tile (TrinityCore/WoW grid)
-    -- World coords increase to the north/east; tiles are 533.3333 wide; origin at (32,32)
-    local GRID_SIZE = 533.3333
-    local ORIGIN_OFFSET = 32
-    local tile_origin_x = (ORIGIN_OFFSET - tile_x) * GRID_SIZE
-    local tile_origin_y = (ORIGIN_OFFSET - tile_y) * GRID_SIZE
-
-    -- Get the tile data for this position
-    local tile_data = LxNavigator.NavMesh.load_tile(position.x, position.y)
-    if not tile_data or not tile_data.vertices or #tile_data.vertices == 0 then
-        return
-    end
-    
-    -- Check if we have polygon data
-    if not tile_data.polygons or #tile_data.polygons == 0 then
-        log_error("No polygon data available in tile")
-        return
-    end
-
-    log_info("Drawing ALL " .. #tile_data.polygons .. " polygons in tile at position: " .. string.format("(%.2f, %.2f, %.2f)", position.x, position.y, position.z))
-    log_info(string.format("Tile indices: (%s, %s) instance_id=%s filename=%s", tostring(tile_x), tostring(tile_y), tostring(instance_id), tostring(tile_data.filename)))
-    -- Also log player pos to compare with first polygon height after mapping
+-- Generate navigation mesh triangles (adapted from LxPS_NewProject optimized implementation)
+local function generate_mesh_triangles()
     local player = core.object_manager.get_local_player()
-    if player then
-        local p = player:get_position()
-        log_info(string.format("Player position: (%.2f, %.2f, %.2f)", p.x, p.y, p.z))
+    if not player then return end
+    
+    local pos = player:get_position()
+    if not pos then return end
+    
+    -- Get tile data for current position
+    local tile_data = LxNavigator and LxNavigator.NavMesh and LxNavigator.NavMesh.load_tile(pos.x, pos.y)
+    if not tile_data or not tile_data.loaded then
+        log_info("No tile data available for mesh generation")
+        return
     end
-
-    -- Throttle structured logfile creation (max 1 file per 2 seconds) and reuse the same file during the interval
-    _G.__lxps_last_draw_log_time = _G.__lxps_last_draw_log_time or 0
-    _G.__lxps_last_draw_log_file = _G.__lxps_last_draw_log_file or nil
-    local now = math.floor(core.game_time())
-    local logfile
-    if now - (_G.__lxps_last_draw_log_time or 0) >= 2000 or not _G.__lxps_last_draw_log_file then
-        logfile = string.format("mmtile_draw_%s_%02d_%02d_%d.log",
-            tostring(instance_id or -1), tonumber(tile_y or -1), tonumber(tile_x or -1), now)
-        core.create_log_file(logfile)
-        _G.__lxps_last_draw_log_time = now
-        _G.__lxps_last_draw_log_file = logfile
+    
+    local current_time = core.time()
+    local tile_key = (tile_data.filename or "unknown") .. "_" .. tostring(math.floor(current_time / mesh_cache.update_interval))
+    
+    -- Check if we need to update cache
+    if mesh_cache.last_tile_key == tile_key and mesh_cache.tris then
+        return -- Use existing cache
+    end
+    
+    log_info("Generating mesh triangles for tile: " .. (tile_data.filename or "unknown"))
+    
+    -- Load raw tile data for detailed triangle parsing
+    local raw_data = tile_data.raw_data
+    if not raw_data or #raw_data == 0 then
+        log_error("No raw tile data available")
+        return
+    end
+    
+    -- Use optimized binary parsing from LxPS_NewProject
+    local triangles = parse_navigation_triangles(raw_data, tile_data)
+    if triangles and #triangles > 0 then
+        mesh_cache.tris = triangles
+        mesh_cache.last_tile_key = tile_key
+        mesh_cache.last_update = current_time
+        
+        -- Expose triangles for rendering
+        _G.LxPS_TestMesh = { tris = mesh_cache.tris }
+        
+        log_info("Generated " .. #triangles .. " navigation triangles")
     else
-        logfile = _G.__lxps_last_draw_log_file
+        log_error("Failed to generate navigation triangles")
     end
-    local function writeln(line) core.write_log_file(logfile, line .. "\n") end
+end
 
-    writeln("=== MMAP TILE DRAW DEBUG ===")
-    writeln(string.format("time_ms=%d instance_id=%s tile_x=%s tile_y=%s", now, tostring(instance_id), tostring(tile_x), tostring(tile_y)))
-    writeln(string.format("world_pos=(%.2f, %.2f, %.2f)", position.x, position.y, position.z))
-    writeln(string.format("filename=%s poly_count=%d vert_count=%d", tostring(tile_data.filename), tile_data.polygon_count or 0, tile_data.vertex_count or 0))
-
-    -- FINAL mapping (absolute coordinates, no extra offsets) + Y sign to match WoW left-handed world:
-    -- Detour vertex: (x, y, z) with y=height, z=east‑west (right‑handed).
-    -- WoW world: (x, y, z) with y=east‑west but left‑handed along Y. Empirically, we must invert Y.
-    -- world = (x, -z, y)
-    local function to_world(v)
-        return { x = v.x, y = -v.z, z = v.y }
+-- Optimized triangle parsing from raw MMAP data (adapted from LxPS_NewProject)
+local function parse_navigation_triangles(data, tile_data)
+    if not data or #data < 120 then return {} end
+    
+    local Vec3 = require("common/geometry/vector_3")
+    local triangles = {}
+    
+    -- Binary reading functions
+    local function read_u32(off)
+        if off + 3 > #data then return nil end
+        local a, b, c, d = string.byte(data, off, off + 3)
+        return a + b*256 + c*65536 + d*16777216
     end
     
-    -- Log tile bounds information (for reference only)
-    if tile_data.tile_bounds then
-        log_info("Tile bounds: min[" .. string.format("%.2f, %.2f, %.2f", tile_data.tile_bounds.min.x, tile_data.tile_bounds.min.y, tile_data.tile_bounds.min.z) ..
-                "] max[" .. string.format("%.2f, %.2f, %.2f", tile_data.tile_bounds.max.x, tile_data.tile_bounds.max.y, tile_data.tile_bounds.max.z) .. "]")
-        writeln(string.format("tile_bounds_min=(%.2f, %.2f, %.2f) tile_bounds_max=(%.2f, %.2f, %.2f)",
-            tile_data.tile_bounds.min.x, tile_data.tile_bounds.min.y, tile_data.tile_bounds.min.z,
-            tile_data.tile_bounds.max.x, tile_data.tile_bounds.max.y, tile_data.tile_bounds.max.z))
-        writeln("note=using world=(x,-z,y) to fix handedness and align with player.y sign")
-    else
-        log_info("No tile bounds data available")
-        writeln("tile_bounds_min=NA tile_bounds_max=NA")
+    local function read_f32(off)
+        if off + 3 > #data then return nil end
+        local b1, b2, b3, b4 = string.byte(data, off, off + 3)
+        local sign = (b4 >= 128) and -1 or 1
+        local exp = ((b4 % 128) * 2) + math.floor(b3 / 128)
+        local mant = ((b3 % 128) * 65536) + (b2 * 256) + b1
+        if exp == 0 then return (mant == 0) and (sign * 0.0) or (sign * mant * 2^-149)
+        elseif exp == 255 then return (mant == 0) and (sign * math.huge) or (0/0) end
+        return sign * (1 + mant / 2^23) * 2^(exp - 127)
     end
-    writeln(string.format("tile_origin=(%.2f, %.2f)", tile_origin_x, tile_origin_y))
     
-    local polygons_drawn = 0
-    local polygons_skipped = 0
-    local first_world_vertices = {}
+    -- Parse MMAP header to get vertex/polygon counts and offsets
+    local off = 1 + 20  -- Skip TrinityCore header
+    local magic = read_u32(off)
+    if magic ~= 0x444E4156 then return {} end  -- Not DNAV format
     
-    -- Draw ALL polygons in the tile
-    for poly_idx, polygon in ipairs(tile_data.polygons) do
-        if polygon.vertices and polygon.vertCount >= 3 then
-            -- Check if polygon is walkable (flags & 1 means walkable in Detour)
-            if polygon.flags and (polygon.flags % 2) == 1 then
-                local polygon_vertices = {}
-                
-                -- Collect polygon vertices (only up to vertCount, ignore padding)
-                for i = 1, polygon.vertCount do
-                    local vert_idx = polygon.vertices[i]
-                    if vert_idx and vert_idx > 0 and vert_idx <= #tile_data.vertices then
-                        local vertex = tile_data.vertices[vert_idx]
-                        if vertex then
-                            -- Enforce consistent world mapping to avoid axis mix-ups
-                            local wv = to_world(vertex)
-                            table.insert(polygon_vertices, wv)
-                            if polygons_drawn == 0 and #first_world_vertices < 4 then
-                                table.insert(first_world_vertices, wv)
-                            end
-                        end
-                    end
-                end
-                
-                -- Draw the polygon if we have enough vertices
-                if #polygon_vertices >= 3 then
-                    -- Log first polygon vertices for debugging
-                    if polygons_drawn == 0 then
-                        log_info("First polygon vertices:")
-                        for vi, v in ipairs(polygon_vertices) do
-                            log_info("  V" .. vi .. ": (" .. string.format("%.2f, %.2f, %.2f", v.x, v.y, v.z) .. ")")
-                        end
-                        -- Also log tile bounds to compare axis ranges
-                        if tile_data.tile_bounds then
-                            log_info(string.format("Bounds check (nav-space): Y(height)=[%.2f..%.2f], Z(east-west)=[%.2f..%.2f]",
-                                tile_data.tile_bounds.min.y, tile_data.tile_bounds.max.y,
-                                tile_data.tile_bounds.min.z, tile_data.tile_bounds.max.z))
-                            if #first_world_vertices > 0 then
-                                local v0 = first_world_vertices[1]
-                                log_info(string.format("Mapped first vertex world=(%.2f, %.2f, %.2f)", v0.x, v0.y, v0.z))
-                                -- Sanity: player vs mapped
-                                local pl = core.object_manager.get_local_player()
-                                if pl then
-                                    local pp = pl:get_position()
-                                    log_info(string.format("Player=(%.2f, %.2f, %.2f) | ΔXY=(%.2f, %.2f) ΔZ=%.2f",
-                                        pp.x, pp.y, pp.z, v0.x - pp.x, v0.y - pp.y, v0.z - pp.z))
-                                end
-                            end
-                        end
-                        -- Persist the first polygon vertices (world-mapped) to logfile for post-mortem
-                        for i, v in ipairs(first_world_vertices) do
-                            writeln(string.format("first_poly_v%d_world=(%.2f, %.2f, %.2f)", i, v.x, v.y, v.z))
-                        end
-                    end
-                    draw_vertex_mesh(polygon_vertices, polygon_color)
-                    polygons_drawn = polygons_drawn + 1
-                else
-                    polygons_skipped = polygons_skipped + 1
-                end
-            else
-                polygons_skipped = polygons_skipped + 1
+    off = off + 4  -- Skip magic
+    local version = read_u32(off); off = off + 4
+    local tile_x = read_u32(off); off = off + 4
+    local tile_y = read_u32(off); off = off + 4
+    local layer = read_u32(off); off = off + 4
+    local user_id = read_u32(off); off = off + 4
+    local poly_count = read_u32(off); off = off + 4
+    local vert_count = read_u32(off); off = off + 4
+    local max_links = read_u32(off); off = off + 4
+    local detail_mesh_count = read_u32(off); off = off + 4
+    local detail_vert_count = read_u32(off); off = off + 4
+    local detail_tri_count = read_u32(off); off = off + 4
+    
+    -- Skip remaining header fields to get to vertex data
+    off = 1 + 20 + 100  -- TrinityCore + DNAV header size
+    
+    -- Parse vertices
+    local vertices = {}
+    if vert_count and vert_count > 0 and off + vert_count*12 <= #data then
+        for i = 1, vert_count do
+            local vx = read_f32(off)
+            local vy = read_f32(off + 4)
+            local vz = read_f32(off + 8)
+            if vx and vy and vz then
+                -- Apply correct coordinate transformation: Game(X,Y,Z) = Nav(Z,X,Y)
+                local wx = vz  -- Nav Z -> Game X (north-south)
+                local wy = vx  -- Nav X -> Game Y (east-west)
+                local wz = vy  -- Nav Y -> Game Z (height)
+                vertices[i] = Vec3.new(wx, wy, wz)
             end
-        else
-            polygons_skipped = polygons_skipped + 1
+            off = off + 12
         end
     end
     
-    log_info("Drew " .. polygons_drawn .. " walkable polygons, skipped " .. polygons_skipped .. " non-walkable/invalid polygons")
-    writeln(string.format("summary: drawn=%d skipped=%d", polygons_drawn, polygons_skipped))
-    writeln("=== END ===")
+    if #vertices == 0 then
+        log_error("No vertices parsed from navigation data")
+        return {}
+    end
+    
+    -- Parse detail triangles (this gives us the actual walkable surface triangulation)
+    local detail_meshes = {}
+    local poly_off = off  -- Current offset after vertices
+    local dt_poly_size = 32  -- Size of dtPoly structure
+    
+    -- Skip to detail meshes
+    local detail_meshes_off = poly_off + (poly_count or 0) * dt_poly_size
+    local detail_verts_off = detail_meshes_off + (detail_mesh_count or 0) * 12
+    local detail_tris_off = detail_verts_off + (detail_vert_count or 0) * 12
+    
+    -- Parse detail triangles for each polygon
+    if detail_tri_count and detail_tri_count > 0 and detail_tris_off + detail_tri_count*4 <= #data then
+        local triangle_count = 0
+        
+        for tri_idx = 0, detail_tri_count - 1 do
+            local tri_off = detail_tris_off + tri_idx * 4
+            if tri_off + 3 <= #data then
+                local i0 = string.byte(data, tri_off) or 0
+                local i1 = string.byte(data, tri_off + 1) or 0
+                local i2 = string.byte(data, tri_off + 2) or 0
+                
+                -- Convert to 1-based indexing and validate
+                local v1 = vertices[i0 + 1]
+                local v2 = vertices[i1 + 1]
+                local v3 = vertices[i2 + 1]
+                
+                if v1 and v2 and v3 then
+                    table.insert(triangles, {v1, v2, v3})
+                    triangle_count = triangle_count + 1
+                end
+            end
+        end
+        
+        log_info("Parsed " .. triangle_count .. " detail triangles from " .. (detail_tri_count or 0) .. " total")
+    else
+        log_warning("No detail triangles available, using polygon fan triangulation")
+        
+        -- Fallback: create triangles from polygon data using fan triangulation
+        -- This is less accurate but better than nothing
+        if poly_count and poly_count > 0 then
+            -- Simplified polygon parsing for fallback triangulation
+            -- Would need full polygon parsing implementation here
+            log_info("Using fallback polygon triangulation (not implemented yet)")
+        end
+    end
+    
+    return triangles
 end
 
--- Enhanced drawing function with polygon visualization using triangles and rectangles
+
+-- Optimized navigation mesh drawing (adapted from LxPS_NewProject)
+-- Uses efficient triangle caching and distance culling to prevent freezes
+local mesh_cache = {
+    tris = nil,
+    last_tile_key = nil,
+    last_update = 0,
+    update_interval = 2000  -- Update cache every 2 seconds
+}
+
 local function draw_navigation_debug()
     if not path_drawing_enabled then
         return
     end
     
-    -- Safely try drawing - if API doesn't exist, disable drawing
     local success, error_msg = pcall(function()
         
-        -- 0. Draw current player polygon if enabled
+        -- Generate mesh triangles if needed
         if draw_current_polygon then
+            generate_mesh_triangles()
+        end
+        
+        -- Draw cached navigation mesh if available
+        if draw_current_polygon and _G.LxPS_TestMesh and _G.LxPS_TestMesh.tris then
+            local Color = require("common/color")
+            local fill = Color.green(60)
             local player = core.object_manager.get_local_player()
-            if player then
-                local player_pos = player:get_position()
-                if player_pos then
-                    draw_polygon_at_position(player_pos, color.new(255, 255, 0, 200))  -- Yellow polygon with higher opacity
-                    -- Draw player position marker
-                    local player_vec = vec3.new(player_pos.x, player_pos.y, player_pos.z + 2.0)
-                    core.graphics.circle_3d_filled(player_vec, 0.5, color.new(255, 255, 0, 255))  -- Bright yellow circle
+            local pos = player and player:get_position() or nil
+            local R2 = 100*100  -- 100 yard culling radius squared
+            
+            for i = 1, #_G.LxPS_TestMesh.tris do
+                local t = _G.LxPS_TestMesh.tris[i]
+                if pos then
+                    -- Distance culling - only draw triangles near player
+                    local ax = t[1].x - pos.x
+                    local ay = t[1].y - pos.y
+                    local bx = t[2].x - pos.x
+                    local by = t[2].y - pos.y
+                    local cx = t[3].x - pos.x
+                    local cy = t[3].y - pos.y
+                    local d2 = math.min(ax*ax + ay*ay, math.min(bx*bx + by*by, cx*cx + cy*cy))
+                    if d2 <= R2 then
+                        core.graphics.triangle_3d_filled(t[1], t[2], t[3], fill)
+                    end
+                else
+                    core.graphics.triangle_3d_filled(t[1], t[2], t[3], fill)
                 end
+            end
+            
+            -- Draw player position marker
+            if pos and draw_current_polygon then
+                local player_vec = vec3.new(pos.x, pos.y, pos.z + 2.0)
+                core.graphics.circle_3d_filled(player_vec, 0.5, color.new(255, 255, 0, 255))
             end
         end
         
-        -- 1. Draw start position polygon (if set)
+        -- Draw start position marker (lightweight)
         if LxTest.state.start_position then
-            draw_polygon_at_position(LxTest.state.start_position, color.new(0, 255, 0, 150))  -- Semi-transparent green
-            -- Draw start position marker
             local start_vec = vec3.new(LxTest.state.start_position.x, LxTest.state.start_position.y, LxTest.state.start_position.z + 2.0)
-            core.graphics.circle_3d_filled(start_vec, 1.0, color.new(0, 255, 0, 255))  -- Bright green circle
+            core.graphics.circle_3d_filled(start_vec, 1.0, color.new(0, 255, 0, 255))
         end
         
-        -- 2. Draw end position polygon (if set)
+        -- Draw end position marker (lightweight)
         if LxTest.state.end_position then
-            draw_polygon_at_position(LxTest.state.end_position, color.new(255, 0, 0, 150))  -- Semi-transparent red
-            -- Draw end position marker
             local end_vec = vec3.new(LxTest.state.end_position.x, LxTest.state.end_position.y, LxTest.state.end_position.z + 2.0)
-            core.graphics.circle_3d_filled(end_vec, 1.0, color.new(255, 0, 0, 255))  -- Bright red circle
+            core.graphics.circle_3d_filled(end_vec, 1.0, color.new(255, 0, 0, 255))
         end
         
-        -- 3. Draw path polygons and waypoints (if exists)
+        -- Draw path lines and waypoints (optimized)
         if LxTest.state.current_path and #LxTest.state.current_path >= 2 then
             local path = LxTest.state.current_path
             
-            -- Draw polygons for each waypoint
-            for i, waypoint in ipairs(path) do
-                draw_polygon_at_position(waypoint, color.new(0, 255, 0, 100))  -- Semi-transparent green for path polygons
-            end
-            
-            -- Draw lines between waypoints
+            -- Draw lines between waypoints (batched)
             for i = 1, #path - 1 do
                 local start_point = path[i]
                 local end_point = path[i + 1]
-                
-                -- Convert table positions to vec3 objects
                 local start_vec = vec3.new(start_point.x, start_point.y, start_point.z)
                 local end_vec = vec3.new(end_point.x, end_point.y, end_point.z)
-                
-                -- Draw line between waypoints (bright green)
-                core.graphics.line_3d(
-                    start_vec,
-                    end_vec,
-                    color.new(0, 255, 0, 255),  -- Bright green
-                    3.0  -- thicker for visibility
-                )
+                core.graphics.line_3d(start_vec, end_vec, color.new(0, 255, 0, 255), 3.0)
             end
             
-            -- Draw waypoint markers
+            -- Draw waypoint markers (batched)
             for i, waypoint in ipairs(path) do
-                local waypoint_color = color.new(0, 0, 255, 255)  -- Blue for regular waypoints
+                local waypoint_color = color.new(0, 0, 255, 255)
                 if i == 1 then
-                    waypoint_color = color.new(0, 255, 0, 255)  -- Green for start
+                    waypoint_color = color.new(0, 255, 0, 255)
                 elseif i == #path then
-                    waypoint_color = color.new(255, 0, 0, 255)  -- Red for end
+                    waypoint_color = color.new(255, 0, 0, 255)
                 end
-                
-                -- Convert position to vec3 object
-                local waypoint_vec = vec3.new(waypoint.x, waypoint.y, waypoint.z + 1.0)  -- Slightly above ground
-                
-                -- Draw circle at each waypoint
-                core.graphics.circle_3d_filled(
-                    waypoint_vec,
-                    0.8,  -- Larger radius for visibility
-                    waypoint_color
-                )
+                local waypoint_vec = vec3.new(waypoint.x, waypoint.y, waypoint.z + 1.0)
+                core.graphics.circle_3d_filled(waypoint_vec, 0.8, waypoint_color)
             end
         end
         
     end)
     
     if not success then
-        -- Only log error occasionally to prevent spam
-        if math.random() < 0.01 then -- 1% chance to log
+        if math.random() < 0.01 then
             log_error("Drawing error: " .. tostring(error_msg))
         end
     end
@@ -670,10 +624,26 @@ local function my_menu_render()
             debug_tile_data()
         end
         
-        menu_elements.draw_current_poly_button:render("Draw Current Polygon: " .. (draw_current_polygon and "ON" or "OFF"))
+        menu_elements.draw_current_poly_button:render("Draw Navigation Mesh: " .. (draw_current_polygon and "ON" or "OFF"))
         if menu_elements.draw_current_poly_button:is_clicked() then
             draw_current_polygon = not draw_current_polygon
-            log_info("Draw current polygon: " .. (draw_current_polygon and "enabled" or "disabled"))
+            log_info("Draw navigation mesh: " .. (draw_current_polygon and "enabled" or "disabled"))
+            if draw_current_polygon then
+                -- Clear cache to force regeneration
+                mesh_cache.tris = nil
+                mesh_cache.last_tile_key = nil
+                _G.LxPS_TestMesh = nil
+            end
+        end
+        
+        menu_elements.generate_mesh_button:render("Generate Mesh Triangles")
+        if menu_elements.generate_mesh_button:is_clicked() then
+            -- Force mesh generation
+            mesh_cache.tris = nil
+            mesh_cache.last_tile_key = nil
+            _G.LxPS_TestMesh = nil
+            generate_mesh_triangles()
+            log_info("Mesh generation triggered")
         end
         
         -- Show basic status using header
